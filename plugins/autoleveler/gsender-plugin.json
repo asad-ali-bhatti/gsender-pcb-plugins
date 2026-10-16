@@ -2,7 +2,7 @@
   "id": "com.asadalibhatti.autoleveler",
   "name": "Autoleveler",
   "description": "Probe a height-map grid, show it on the visualizer, and level the loaded G-code to it (PCB milling, engraving).",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "engine": ">=1.6.0",
   "ui": {
     "entry": "ui/index.html",
