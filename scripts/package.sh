@@ -6,6 +6,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$ROOT/dist"
 for dir in "$ROOT"/plugins/*/; do
 	name=$(basename "$dir")
+	# Plugins still in development have no manifest yet and are not released.
+	[ -f "$dir/gsender-plugin.json" ] || { echo "skip $name: no gsender-plugin.json" >&2; continue; }
 	version=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1])).version)" "$dir/gsender-plugin.json")
 	out="$ROOT/dist/$name-$version.zip"
 	rm -f "$out"

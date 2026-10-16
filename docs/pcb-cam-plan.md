@@ -42,29 +42,34 @@ Findings that shape the design (from inspecting gSender Edge 1.7's plugin loader
 **Key idea: one declarative project document.** The plugin UI and the MCP tools both edit the same JSON project and nothing else. Generating output is a pure function: `generate(project, inputFiles, toolDB) → { toolpaths, gcode, warnings }`. Because of that, anything an agent does can be reviewed, diffed, re-run and edited by hand, and the reverse is also true. The output is deterministic, so golden tests work.
 
 ### Project document (`board.pcbcam.json`)
+The authoritative definition is `PROJECT_SCHEMA` in `plugins/pcb-cam/ui/core/project.js`. A trimmed example:
 ```jsonc
 {
-  "version": 1, "units": "mm",
-  "inputs": [ {"id":"top","role":"copper","side":"top","file":"F_Cu.gbr"},
-              {"id":"pth","role":"drill","file":"PTH.drl"},
-              {"id":"edge","role":"outline","file":"Edge_Cuts.gbr"} ],
-  "setup":  { "stockThickness":1.6, "origin":"board-lower-left", "mirror":null, "safeZ":3, "travelZ":1 },
+  "version": 1, "name": "demo",
+  "inputs": [ {"id":"top","file":"demo-F_Cu.gtl","role":"copper","side":"top"},
+              {"id":"drill","file":"demo-PTH.drl","role":"drill","side":null,"plated":true},
+              {"id":"edge","file":"demo-Edge_Cuts.gm1","role":"outline","side":null} ],
+  "setup":  { "stockThickness":1.6, "safeZ":5, "travelZ":1, "origin":"gerber", "material":"FR1" },
   "regions": [
-    {"id":"fine",  "shape":{"component":"U3","margin":1.5}},     // from Gerber X2 %TO.C attributes
-    {"id":"box",   "shape":{"rect":[10,10,30,25]}},
-    {"id":"rest",  "shape":"remainder"}                           // layer minus other regions used on it
-  ],
+    {"id":"fine", "shape":{"kind":"component","ref":"U3","margin":1.5}},   // pads with X2 %TO.P,U3
+    {"id":"box",  "shape":{"kind":"rect","rect":[10,10,30,25]}},
+    {"id":"rest", "shape":{"kind":"remainder"}}                            // layer minus other regions used on it
+  ],                                                                       // also: polygon, net
   "operations": [
-    {"id":"iso-fine","type":"isolation","input":"top","region":"fine","tool":"vbit-20deg-0.1",
-     "depth":0.08,"passes":3,"overlap":0.4,"direction":"climb"},
-    {"id":"iso-rest","type":"isolation","input":"top","region":"rest","tool":"vbit-30deg-0.2","passes":2},
-    {"id":"clear",   "type":"clearing", "input":"top","region":"rest","tool":"em-0.8","rest":true},
-    {"id":"drill",   "type":"drilling", "input":"pth","toolMap":"auto","millAbove":1.2,"millTool":"em-0.8"},
-    {"id":"cut",     "type":"cutout",   "input":"edge","tool":"em-1.5","tabs":{"count":4,"width":2,"height":0.6}}
-  ],
-  "output": { "dialect":"grbl", "toolChange":"m6" /* | "split-files" */, "order":"auto" /* or op ids */ }
+    {"id":"iso-fine","type":"isolation","enabled":true,"input":"top","region":"fine","tool":"vbit-20-0.1",
+     "depth":0.05,"passes":3,"overlap":0.4,"direction":"climb"},
+    {"id":"iso-rest","type":"isolation","enabled":true,"input":"top","region":"rest","tool":"vbit-30-0.2",
+     "depth":0.05,"passes":2,"overlap":0.4,"direction":"climb"},
+    {"id":"drill","type":"drilling","enabled":true,"input":"drill","tool":"drill-1.0","holes":"all","breakthrough":0.2,"peck":0},
+    {"id":"cut","type":"cutout","enabled":true,"input":"edge","tool":"em-0.8","breakthrough":0.2,"side":"outside",
+     "tabs":{"count":4,"width":2,"height":0.6}}
+  ],                                                                       // also: clearing (depth, overlap, rest)
+  "tools": [ /* snapshots of the tool database entries the operations use */ ],
+  "output": { "dialect":"grbl", "toolChange":"m6" /* or "split" */, "decimals":4 }
 }
 ```
+Operation parameters beyond those above (drill-to-mill, clearing strategy) are settled in Phase 2.
+
 ### Tool database
 gSender has no tool database. Its `workspace.tools` is only a fixed list of five end-mill diameters for the Probe widget's dropdown, and plugins can't write to the workspace. So PCB CAM keeps its own.
 
@@ -141,8 +146,10 @@ No MCP tool touches the controller.
 plugins/pcb-cam/gsender-plugin.json
 plugins/pcb-cam/ui/index.html, assets/index.js, assets/index.css
 plugins/pcb-cam/ui/core/            ← cam-core lives here, so the plugin stays self-contained with no build step
-    gerber/ excellon/ geometry/ tools/ project/ regions.js ops/ plan.js gcode/ analysis/ render/
-plugins/pcb-cam/ui/vendor/          ← vendored ESM (.js): Gerber parser (@tracespace/parser + moo, MIT), clipper-lib 6.4.2 (Boost)
+    geometry.js  schema.js  tools.js  project.js  inspect.js  index.js        (Phase 1)
+    import/ gerber.js excellon.js detect.js index.js                          (Phase 1)
+    regions.js ops/ plan.js gcode/ analysis/ render/                          (Phase 2+)
+plugins/pcb-cam/ui/vendor/          ← clipper-lib 6.4.2 (Boost) wrapped as ESM; the only third-party code
 mcp/package.json, mcp/src/server.js ← imports ../plugins/pcb-cam/ui/core directly
 tests/cam/*.test.mjs, tests/fixtures/<board>/ (KiCad gerbers + golden .nc)
 ```
@@ -161,13 +168,22 @@ Changes to existing files:
 - **Errors and warnings are structured data:** `{ code, message, severity, at: [x, y], opId }`, not just strings, so an agent can act on them later.
 
 0. **Spikes (de-risk):** done; see Phase 0 findings below.
-1. **Core import and geometry:**
-   - Gerber RS-274X import (apertures, macros, regions, polarity, step-repeat, X2 attributes from raw text).
-   - Our own Excellon parser (decimal and fixed formats, inch/metric, `G85` slots).
-   - Geometry wrapper over `clipper-lib`: union, difference, intersect, offset, polygons with holes.
-   - Project schema, the command layer and validation.
-   - Tool database model.
-   - Fixtures: 2–3 real KiCad boards exported with kicad-cli.
+1. **Core import and geometry:** done (2026-10-16).
+   - **Gerber parser and plotter, our own.** tracespace was dropped: it strips spaces from attribute values and turns any command it doesn't know into an `unimplemented` node, so missing geometry would go unnoticed. Ours handles:
+     - Apertures C/R/O/P with holes, and macros (all primitives, variables, expressions, exposure).
+     - Strokes, including convex non-circular pens, and G74/G75 arcs.
+     - Regions with cut-ins, polarity, step & repeat, aperture blocks, LR/LS, and X2 attributes (also as `G04 #@!` comments).
+     - Anything unsupported or ambiguous (LM, IPNEG, a clear-flashed block, overlapping SR with clear) becomes an `error` issue rather than a guess.
+   - **Our own Excellon parser:** decimal, LZ/TZ/keep formats, KiCad's `FORMAT={a:b}` comment, inch/metric, G85 and routed slots, repeat, incremental, and per-tool X2 plating.
+   - **Layer detection:** X2 first, then KiCad, Protel/Altium, Eagle and EasyEDA naming, then content.
+   - **Geometry:** a wrapper over `clipper-lib` with 0.1 µm integer units, which keeps KiCad page coordinates on clipper's fast path.
+   - **Project:** JSON-Schema project and tool schemas, the command layer (`applyCommand`, `COMMANDS`), `validateProject`, and `inspectBoard` (layers, board size from the outline centreline, components, nets, drill histogram).
+   - **Verification:**
+     - 47 unit tests (Node 22 and 24).
+     - 572 KiCad Gerbers and 60 drill files parse with no issues.
+     - 16 KiCad drill-format variants of one board agree to 1.44 µm.
+     - 10 copper layers from 5 KiCad demo boards match KiCad's own SVG plot pixel for pixel at 80 px/mm (12.5 µm). The comparator was confirmed to catch one dropped pad and a 50 µm shift.
+     - The core gives identical results in Chrome and Node.
 2. **Operations and G-code:**
    - Isolation (multi-pass, V-bit width from depth, climb/conventional) with region clipping and seams.
    - Drilling (tool mapping, mill oversize holes, peck).
@@ -198,7 +214,7 @@ A throwaway spike plugin was run inside gSender's plugin page (served by the gSe
 | ESM file types | `.mjs` is served as `application/octet-stream`, which browsers reject for modules. `.js` is served as `application/javascript`. | All plugin modules, vendored ones included, use `.js`. |
 | Vendored libs in iframe | `@tracespace/parser` + `moo` (UMD wrapped as ESM) and `clipper-lib` load and give the same results as in Node. KiCad F.Cu parses in about 14 ms. | Same core code runs in both places. |
 | Polygon library | `clipper2-js` 1.2.4 produces **wrong offsets**: miter joins give a lopsided shape, and the area is off by about 20%. `clipper-lib` 6.4.2 is exact (53.031 mm² vs 53.031 expected). | Use `clipper-lib`, behind our own geometry wrapper so it can be swapped later. |
-| Gerber parser | tracespace parses graphics, apertures, macros and regions. X2 attributes (`%TO.P/N/C`, `%TA`, `%TF`) come through as `unimplemented` nodes with whitespace stripped, but with source offsets. | Read X2 attributes by slicing the raw source at those offsets. Refdes for component regions is in `%TO.P` (82 components on the test board). |
+| Gerber parser | (Superseded in Phase 1 by our own parser.) tracespace parses graphics, apertures, macros and regions. X2 attributes (`%TO.P/N/C`, `%TA`, `%TF`) come through as `unimplemented` nodes with whitespace stripped, but with source offsets. | Read X2 attributes by slicing the raw source at those offsets. Refdes for component regions is in `%TO.P` (82 components on the test board). |
 | Excellon parser | tracespace **drops all holes** in KiCad drill files (`FMAT,2`, decimal) and has no `G85` slot support. | Write our own Excellon parser: decimal and fixed formats, inch/metric, `G85` slots, X2 comments. |
 | Localhost link | `fetch` and `WebSocket` to `127.0.0.1:<port>` both work from the plugin iframe. Requests carry `Origin: http://127.0.0.1:<gSender port>`. gSender's port is random per launch. | Live link is viable. The MCP server checks for a loopback origin on any port plus a token. |
 | Tool changes | Plugins can read `workspace.toolChangeOption` via `getWorkspaceState()`. The default is **`Ignore`**, which means `M6` does nothing. Other values: Pause, Standard Re-zero, Flexible Re-zero, Fixed Tool Sensor, Code, plus ATC passthrough. gSender shows a per-tool timeline from the `M6 T<n>` events in a loaded file. | Output options: a single file with `M6 T<n>` when tool changes are enabled, or split files per tool. The plugin warns if the job has more than one tool and the option is `Ignore`. |
