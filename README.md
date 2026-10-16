@@ -1,6 +1,6 @@
 # gSender PCB Plugins
 
-Plugins for [gSender](https://github.com/Sienci-Labs/gsender) that turn a hobby CNC into a PCB mill: probe and level the board, then (planned) generate isolation, drilling and cutout toolpaths without leaving gSender. The aim is to bring the PCB features of [FlatCAM](http://flatcam.org/) into gSender. Autoleveler is the first piece; the rest will likely grow into a single full-featured PCB fab plugin rather than one plugin per tool.
+Plugins for [gSender](https://github.com/Sienci-Labs/gsender) that turn a hobby CNC into a PCB mill: probe and level the board, then (planned) generate isolation, drilling and cutout toolpaths without leaving gSender. Two independent plugins: **Autoleveler** for probing and levelling, and **PCB CAM** (planned), one place for the whole fabrication process from Gerber files to G-code, bringing the PCB features of [FlatCAM](http://flatcam.org/) into gSender.
 
 > Requires gSender **1.6+** with plugin support (tested against 1.7.0 Edge). Grbl and grblHAL controllers.
 
@@ -53,9 +53,9 @@ Conventions:
 - Import SDK functions by name (`import { machine, viewer } from '@sienci/gsender-plugin-sdk'`). gSender's installer scans those imports to decide what the plugin may access.
 - The plugin iframe has no `allow-downloads` or `allow-modals`. Use the clipboard or text areas for export, and use inline confirmations instead of `confirm()`.
 
-## Roadmap: FlatCAM features
+## Roadmap: PCB CAM plugin
 
-How these are packaged is still open. The likely shape is one full-featured PCB fab plugin that grows to cover them, with Autoleveler either folded in or kept alongside it.
+A single full-featured plugin that turns Gerber and Excellon files into G-code. It is designed MCP-first: an AI agent can drive the whole conversion (for example a fine V-bit in one region of the board and a coarser bit elsewhere, in one job) through an MCP server that ships with it. The agent only generates G-code; loading and running it stays with you.
 
 | Planned feature | FlatCAM equivalent |
 |---|---|
@@ -66,8 +66,6 @@ How these are packaged is still open. The likely shape is one full-featured PCB 
 | Double-sided alignment | Double-Sided tool: mirror axis and alignment-hole drilling |
 | Tool database | Tools DB: shared bit library (V-bits with measured tip and angle) used by every tool |
 | Paste / solder-mask stencils | Solder Paste tool |
-
-Each will reuse the Autoleveler height map, so generated jobs can be levelled in one step.
 
 ## License
 
