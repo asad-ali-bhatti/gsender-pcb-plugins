@@ -1,0 +1,45 @@
+{
+  "id": "com.asadalibhatti.autoleveler",
+  "name": "Autoleveler",
+  "description": "Probe a height-map grid, show it on the visualizer, and level the loaded G-code to it (PCB milling, engraving).",
+  "version": "0.1.0",
+  "engine": ">=1.6.0",
+  "ui": {
+    "entry": "ui/index.html",
+    "contributions": [
+      {
+        "slot": "visualizer-overlay",
+        "label": "Autolevel",
+        "icon": "▦"
+      }
+    ]
+  },
+  "permissions": ["machine:read", "machine:write", "machine:parse", "machine:query", "visualizer:load", "redux:read", "viewer:camera", "viewer:draw", "storage"],
+  "capabilities": {
+    "requestTypes": [
+      "machine:get:context",
+      "machine:command",
+      "machine:query",
+      "machine:busy:set",
+      "machine:parser:register",
+      "machine:parser:unregister",
+      "gcode:load:to:visualizer",
+      "redux:get:state",
+      "viewer:screen-to-world",
+      "viewer:world-to-screen",
+      "viewer:camera:set",
+      "viewer:camera:lock-rotate",
+      "viewer:pick:arm",
+      "viewer:pick:disarm",
+      "viewer:overlay:set",
+      "storage:get",
+      "storage:set",
+      "storage:delete",
+      "storage:get:all",
+      "storage:set:all",
+      "storage:clear"
+    ],
+    "topics": ["controller", "viewer"],
+    "allowedFunctions": ["machine", "viewer", "gcode", "storage", "getReduxState"]
+  }
+}

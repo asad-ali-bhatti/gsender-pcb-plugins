@@ -1,0 +1,41 @@
+<!doctype html><meta charset=utf-8><title>mock host</title>
+<body style="margin:0;background:#222">
+<div style="position:relative;width:100vw;height:100vh">
+<div id=panel style="position:absolute;right:16px;top:16px;bottom:16px;width:320px;background:#fff;display:flex;flex-direction:column"><div style="padding:8px">Autolevel</div><div style="flex:1;min-height:0;padding:8px;display:flex"><iframe id=f src="/plugins/autoleveler/index.html" style="flex:1;border:0"></iframe></div></div></div>
+<script>
+const CH='gsender:plugin-bridge';
+const store={}; window.H={overlay:[],loaded:null,queries:[],busy:[],commands:[]};
+const wco={x:-100,y:-80,z:-40};           // machine = work + wco
+let pos={x:0,y:0,z:5};                    // work coords
+let zoff=0;                               // G10 shifts
+const surf=(x,y)=>0.002*x-0.003*y+0.0004*(x-25)*(y-15)-0.3; // work Z of copper before re-zero
+const gc=`G21 G90\nG0 Z2\nG0 X5 Y5\nG1 Z-0.05 F60\nG1 X45 Y5 F300\nG2 X45 Y25 I0 J10\nG1 X5 Y25\nG0 Z2\nM5`;
+const redux={connection:{isConnected:true},controller:{state:{status:{activeState:'Idle'}}},
+  file:{fileLoaded:true,name:'test.nc',content:gc,bbox:{min:{x:5,y:5,z:-0.05},max:{x:55,y:25,z:2}}}};
+function query(cmd){
+  H.queries.push(cmd); const n=s=>{const m=new RegExp(s+'([-.\\d]+)').exec(cmd);return m?+m[1]:undefined};
+  if(/^G38\.2/.test(cmd)){const t=n('Z'); const sz=surf(pos.x,pos.y)-zoff; if(sz<pos.z && sz>=t){pos.z=sz; return ['[PRB:'+[pos.x+wco.x,pos.y+wco.y,pos.z+wco.z+zoff].map(v=>v.toFixed(3)).join(',')+':1]']}
+    pos.z=t; return ['[PRB:0,0,0:0]','ALARM:5'];}
+  if(/^G10 L20 P0 Z0/.test(cmd)){zoff+=pos.z; pos.z=0; return ['ok'];}
+  if(/^G0/.test(cmd)){for(const a of 'XYZ'){const v=n(a); if(v!==undefined)pos[a.toLowerCase()]=v;} return ['ok'];}
+  return ['ok'];
+}
+async function handle(t,p){switch(t){
+ case 'storage:get': return p.key in store?store[p.key]:p.defaultValue;
+ case 'storage:set': store[p.key]=JSON.parse(JSON.stringify(p.value)); return {ok:true};
+ case 'storage:delete': delete store[p.key]; return {ok:true};
+ case 'machine:get:context': return {connected:true,position:{x:pos.x+wco.x,y:pos.y+wco.y,z:pos.z+wco.z+zoff},workPosition:{...pos}};
+ case 'redux:get:state': return redux;
+ case 'machine:query': await new Promise(r=>setTimeout(r,5)); return {lines:query(p.cmd),complete:true,reason:'until'};
+ case 'machine:busy:set': H.busy.push(p.busy); return {ok:true};
+ case 'machine:command': H.commands.push(p.cmd); return {ok:true};
+ case 'viewer:overlay:set': H.overlay=p.markers; draw(); return {ok:true};
+ case 'viewer:camera:set': return {ok:true};
+ case 'gcode:load:to:visualizer': H.loaded=p; redux.file={...redux.file,name:p.name,content:p.gcode}; return {ok:true,name:p.name};
+ default: throw new Error('unknown '+t);}}
+function draw(){let svg=document.querySelector('body>svg'); if(!svg){svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.style.cssText=["position:fixed","inset:0","width:100vw","height:100vh","pointer-events:none","z-index:10"].join(";");document.body.appendChild(svg);}
+ svg.innerHTML=''; for(const m of H.overlay){const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('cx',100+m.x*30);c.setAttribute('cy',900-m.y*30);c.setAttribute('r',m.size+2);c.setAttribute('fill',m.color||'#999');svg.appendChild(c);}}
+addEventListener('message',async e=>{const d=e.data; if(!d||d.channel!==CH||!d.request)return;
+  let res; try{res={id:d.request.id,ok:true,result:await handle(d.request.type,d.request.payload||{})}}catch(err){res={id:d.request.id,ok:false,error:err.message}}
+  e.source.postMessage({channel:CH,response:res},'*');});
+</script>
