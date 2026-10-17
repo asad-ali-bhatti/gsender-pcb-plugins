@@ -205,6 +205,32 @@ function clipOverlayAroundPanel() {
     });
 }
 
+/**
+ * gSender rebuilds the overlay SVG on every animation frame. When usage data
+ * collection is on, PostHog's session recorder keeps each of those DOM
+ * mutations (~14 MB/s with a full map) until the renderer runs out of memory.
+ * `ph-no-capture` makes the recorder skip the element; the SVG is recreated
+ * whenever the marker list goes from empty to non-empty, so watch for it.
+ */
+function excludeOverlayFromRecording() {
+    let pdoc;
+    try {
+        pdoc = window.parent.document;
+    } catch {
+        return;
+    }
+    if (!pdoc || pdoc === document) return;
+    const mark = () => {
+        for (const el of pdoc.querySelectorAll('body > svg[style*="pointer-events: none"][style*="z-index: 10"]')) {
+            el.classList.add('ph-no-capture');
+        }
+    };
+    mark();
+    const observer = new pdoc.defaultView.MutationObserver(mark);
+    observer.observe(pdoc.body, { childList: true });
+    window.addEventListener('pagehide', () => observer.disconnect());
+}
+
 // ---------------------------------------------------------------------------
 // Machine I/O
 // ---------------------------------------------------------------------------
@@ -424,6 +450,7 @@ function importMap(text) {
         saveMap();
         setMsg('ok', `Imported ${m.nx}×${m.ny} map${isComplete(m) ? '' : ' (incomplete, press Resume to finish)'}.`);
         render();
+        drawOverlay();
     } catch (e) {
         setMsg('err', `Import failed: ${e.message}`);
     }
@@ -663,7 +690,7 @@ function tabApply() {
             h('div', { className: 'row' },
                 h('button', {
                     className: 'b', disabled: !map || state.scanning,
-                    onClick: () => { state.map = null; storage.delete('map').catch(() => {}); setMsg('info', 'Height map cleared.'); render(); },
+                    onClick: () => { state.map = null; storage.delete('map').catch(() => {}); setMsg('info', 'Height map cleared.'); render(); drawOverlay(); },
                 }, 'Clear map'))),
     ];
 }
@@ -709,6 +736,7 @@ async function init() {
     render();
     if (state.tab === 'apply') refreshFile();
     clipOverlayAroundPanel();
+    excludeOverlayFromRecording();
     drawOverlay();
     pollConnection();
     setInterval(pollConnection, 2000);
