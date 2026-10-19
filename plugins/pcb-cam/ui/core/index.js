@@ -7,3 +7,8 @@ export { validate } from './schema.js';
 export { TOOL_SCHEMA, TOOL_DB_SCHEMA, validateTool, widthAtDepth, depthForWidth, cuttingFor, createToolDb, findTool, setTool, removeTool } from './tools.js';
 export { PROJECT_SCHEMA, COMMANDS, createProject, applyCommand, validateProject, componentOf, netOf } from './project.js';
 export { inspectBoard } from './inspect.js';
+export { boardFromOutline } from './board.js';
+export { regionMask, shapeMask } from './regions.js';
+export { generate, resolveFaces } from './plan.js';
+export { emitGrbl } from './gcode/grbl.js';
+export { narrowGaps, analyzeProject, suggestRegions } from './analysis/index.js';

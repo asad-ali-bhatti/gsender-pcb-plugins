@@ -304,3 +304,68 @@ export function containsPoint(shape, x, y) {
     }
     return winding !== 0;
 }
+
+/** Fills closed paths with the even-odd rule (nested outlines alternate solid / hole). */
+export function fillEvenOdd(paths) {
+    const valid = paths.filter((p) => p.length >= 3);
+    if (!valid.length) return [];
+    const c = new C.Clipper();
+    c.AddPaths(valid, C.PolyType.ptSubject, true);
+    const out = new C.Paths();
+    if (!c.Execute(C.ClipType.ctUnion, out, C.PolyFillType.pftEvenOdd, C.PolyFillType.pftEvenOdd)) throw new Error('Polygon operation failed');
+    return out;
+}
+
+/**
+ * Clips open polylines (Paths) against a shape. Returns the pieces inside the
+ * shape, or outside it with `{ outside: true }`. Direction is preserved, so a
+ * closed ring passed with its first point repeated at the end comes back as
+ * one or more open pieces running the same way.
+ */
+export function clipOpen(paths, shape, { outside = false } = {}) {
+    const valid = paths.filter((p) => p.length >= 2);
+    if (!valid.length) return [];
+    if (!shape.length) return outside ? valid : [];
+    const c = new C.Clipper();
+    c.AddPaths(valid, C.PolyType.ptSubject, false);
+    c.AddPaths(shape, C.PolyType.ptClip, true);
+    const tree = new C.PolyTree();
+    const type = outside ? C.ClipType.ctDifference : C.ClipType.ctIntersection;
+    if (!c.Execute(type, tree, C.PolyFillType.pftNonZero, C.PolyFillType.pftNonZero)) throw new Error('Polygon operation failed');
+    return C.Clipper.OpenPathsFromPolyTree(tree);
+}
+
+/** Removes vertices closer than `distance` mm to their neighbours or collinear within it. */
+export function simplifyPaths(paths, distance) {
+    return C.Clipper.CleanPolygons(paths, distance * SCALE).filter((p) => p.length >= 3);
+}
+
+/** Length of a polyline of mm points (closed when `closed`). */
+export function polylineLength(points, closed = false) {
+    let len = 0;
+    for (let i = 1; i < points.length; i++) len += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
+    if (closed && points.length > 1) {
+        const a = points[points.length - 1], b = points[0];
+        len += Math.hypot(a[0] - b[0], a[1] - b[1]);
+    }
+    return len;
+}
+
+/**
+ * Area swept by a round tool of `width` mm along closed loops and open lines
+ * (mm points). One offset call for everything, so it stays fast for whole layers.
+ */
+export function sweep(loops, lines, width, { tol = ARC_TOLERANCE } = {}) {
+    if (!(width > 0) || (!loops.length && !lines.length)) return [];
+    const co = new C.ClipperOffset(2, Math.max(1, tol * SCALE));
+    const dots = [];
+    for (const l of loops) if (l.length >= 2) co.AddPath(toPath(l), C.JoinType.jtRound, C.EndType.etClosedLine);
+    for (const l of lines) {
+        const path = toPath(l).filter((p, i, a) => i === 0 || p.X !== a[i - 1].X || p.Y !== a[i - 1].Y);
+        if (path.length >= 2) co.AddPath(path, C.JoinType.jtRound, C.EndType.etOpenRound);
+        else if (path.length === 1) dots.push(toPath(circle(l[0][0], l[0][1], width, tol)));
+    }
+    const out = new C.Paths();
+    co.Execute(out, (width / 2) * SCALE);
+    return normalize([...out, ...dots]);
+}

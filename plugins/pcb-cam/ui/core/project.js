@@ -41,6 +41,7 @@ const opBase = {
     input: id,
     region: { type: ['string', 'null'], pattern: ID_PATTERN },
     tool: id,
+    face: { enum: ['top', 'bottom'], description: 'Board side facing up while this operation runs; bottom mirrors X about the board centre. Default: the copper input\'s side; drilling and cutout follow the copper operations when they are all on the bottom, else top' },
 };
 const opRequired = ['id', 'type', 'enabled', 'input', 'tool'];
 
@@ -76,6 +77,7 @@ const OPERATION = {
                 type: { const: 'cutout' },
                 breakthrough: num({ minimum: 0, maximum: 5 }),
                 side: { enum: ['outside', 'inside', 'on'] },
+                direction: { enum: ['climb', 'conventional'] },
                 tabs: {
                     type: 'object', additionalProperties: false, required: ['count', 'width', 'height'],
                     properties: { count: { type: 'integer', minimum: 0, maximum: 64 }, width: num({ exclusiveMinimum: 0, maximum: 20 }), height: num({ minimum: 0, maximum: 5 }) },
@@ -123,6 +125,7 @@ const OUTPUT = {
         dialect: { enum: ['grbl'] },
         toolChange: { enum: ['m6', 'split'], description: 'One file with M6 tool changes, or one file per tool' },
         decimals: { type: 'integer', minimum: 3, maximum: 5 },
+        spindleDelay: num({ minimum: 0, maximum: 30, description: 'Seconds to wait after starting the spindle; default 2' }),
     },
 };
 
@@ -241,7 +244,7 @@ const COMMAND_LIST = [
     },
     {
         name: 'region.set',
-        description: 'Create or replace a region: a rectangle, polygon, component (refdes + margin), net (+ margin), or "remainder" (everything not covered by the other regions used on the same input).',
+        description: 'Create or replace a region: a rectangle, polygon, component (refdes + margin), net (+ margin), or "remainder" (everything not covered by the other regions that operations of the same type use on the same input).',
         input: obj({ id, name: { type: 'string', maxLength: 100 }, shape: REGION_SHAPE }, ['id', 'shape']),
         apply(p, a) {
             const i = p.regions.findIndex((r) => r.id === a.id);
