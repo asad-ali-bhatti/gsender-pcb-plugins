@@ -1,0 +1,41 @@
+{
+  "id": "com.asadalibhatti.pcb-cam",
+  "name": "PCB CAM",
+  "description": "Gerber/Excellon to G-code: isolation routing, drilling, cutout and copper clearing, with a tool library and toolpath preview. Loads the result into gSender.",
+  "version": "0.0.1",
+  "engine": ">=1.6.0",
+  "ui": {
+    "entry": "ui/index.html",
+    "contributions": [
+      {
+        "slot": "tools-page",
+        "route": "pcb-cam",
+        "label": "PCB CAM"
+      }
+    ]
+  },
+  "permissions": [
+    "storage",
+    "visualizer:load",
+    "workspace:read",
+    "fileSystem"
+  ],
+  "capabilities": {
+    "requestTypes": [
+      "workspace:get:state",
+      "gcode:load:to:visualizer",
+      "storage:get",
+      "storage:set",
+      "storage:delete",
+      "storage:get:all",
+      "storage:set:all",
+      "storage:clear"
+    ],
+    "topics": [],
+    "allowedFunctions": [
+      "storage",
+      "gcode",
+      "getWorkspaceState"
+    ]
+  }
+}
