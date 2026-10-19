@@ -2,6 +2,7 @@ import { machine, viewer, gcode, storage, getReduxState } from '@sienci/gsender-
 import {
     gridPoints, createHeightMap, validateGrid, isComplete, mapStats, heightAt, parsePRB, levelGcode, fmt,
 } from './leveling.js';
+import { runScan, validateScanSettings } from './scan.js';
 
 // ---------------------------------------------------------------------------
 // State
@@ -10,8 +11,11 @@ import {
 const DEFAULTS = {
     xmin: 0, xmax: 50, ymin: 0, ymax: 30, nx: 5, ny: 4,
     margin: 1,
-    clearance: 2,      // work Z for travel between points
-    depth: -2,         // lowest work Z the probe may reach before failing
+    fileBbox: null,    // job bounds last used by "Use loaded file bounds"
+    clearance: 2,      // travel height above the first point's surface, mm
+    maxBelow: 1,       // how far below the first point's surface later probes may go, mm
+    firstTravel: 10,   // how far the first probe may travel down from the start height, mm
+    probeTest: true,   // ask for a touch test of the probe input before moving
     feed: 60,          // first (fast) probe feed, mm/min
     slowFeed: 15,      // second probe feed, 0 disables
     backoff: 0.5,      // retract before second probe
@@ -33,6 +37,7 @@ const state = {
     msg: null,
     log: [],
     connected: false,
+    probeOn: null,     // probe input triggered (live), null when unknown
     file: null,
     confirmApply: false,
 };
@@ -56,8 +61,11 @@ function h(tag, props = {}, ...children) {
     return el;
 }
 
-const saveSettings = debounce(() => storage.set('settings', state.s).catch(() => {}), 300);
-const saveMap = () => storage.set('map', state.map).catch((e) => log(`Could not save map: ${e.message}`));
+// gSender's storage.set deep-merges into the stored value (arrays index by
+// index), so a smaller map would keep stale heights. Delete first to replace.
+const replaceStored = async (key, value) => { await storage.delete(key); await storage.set(key, value); };
+const saveSettings = debounce(() => replaceStored('settings', state.s).catch(() => {}), 300);
+const saveMap = () => replaceStored('map', state.map).catch((e) => log(`Could not save map: ${e.message}`));
 
 function setMsg(kind, text) { state.msg = text ? { kind, text } : null; renderMsg(); }
 function log(line) {
@@ -235,30 +243,29 @@ function excludeOverlayFromRecording() {
 // Machine I/O
 // ---------------------------------------------------------------------------
 
-const FAIL_RE = /^(error:|ALARM:)/;
+const REPLY_RE = /^(ok|error:\d+|ALARM:\d+)/;
 
-async function q(cmd, timeout = 10000) {
-    log(`> ${cmd}`);
-    const r = await machine.query(cmd, { timeout, until: /^(ok|error:\d+|ALARM:\d+)/ });
-    const bad = r.lines.find((l) => FAIL_RE.test(l));
-    if (bad) throw new Error(`${cmd} → ${bad}`);
-    if (!r.complete) throw new Error(`${cmd}: no response (${r.reason})`);
-    return r;
+/**
+ * Sends one command and returns its reply lines. A probe reply is captured up
+ * to the `ok` after `[PRB:]`, so no stray `ok` is left for the next query; if
+ * a stray `ok` from elsewhere ended the capture before the PRB report, a
+ * `G4 P0` (waits for motion to finish) collects the rest.
+ */
+async function sendLine(cmd, { probe = false, timeout = 10000 } = {}) {
+    const r = await machine.query(cmd, { timeout, until: REPLY_RE, maxLines: 50 });
+    let lines = r.lines;
+    if (probe && !parsePRB(lines) && !lines.some((l) => /^(error:|ALARM:)/.test(l))) {
+        const more = await machine.query('G4 P0', { timeout, until: /^(\[PRB:|error:|ALARM:)/, maxLines: 50 });
+        lines = lines.concat(more.lines);
+        await machine.query('G4 P0', { timeout: 10000, until: REPLY_RE }).catch(() => {});
+    }
+    if (!r.complete && !lines.some((l) => REPLY_RE.test(l))) throw new Error(`${cmd}: no response (${r.reason})`);
+    return lines;
 }
 
-/** Runs G38.2 and returns the contact point in machine coordinates. */
-async function probe(targetZ, feed, timeout) {
-    const cmd = `G38.2 Z${fmt(targetZ)} F${fmt(feed, 1)}`;
-    log(`> ${cmd}`);
-    // Stop on the PRB report itself so a stray `ok` from another sender can't end the capture early.
-    const r = await machine.query(cmd, { timeout, until: /^(\[PRB:|ALARM:|error:)/, maxLines: 50 });
-    const prb = parsePRB(r.lines);
-    const bad = r.lines.find((l) => FAIL_RE.test(l));
-    if (bad && !prb) throw new Error(`Probe failed: ${bad}`);
-    if (!prb) throw new Error(`Probe gave no result (${r.reason}). Check probe wiring.`);
-    if (!prb.ok) throw new Error(`Probe did not touch before Z${fmt(targetZ)}. Lower "Probe to Z" or zero Z closer to the surface.`);
-    log(`< PRB Z${fmt(prb.z)}`);
-    return prb;
+async function probePin() {
+    const rs = await getReduxState();
+    return !!rs?.controller?.state?.status?.pinState?.P;
 }
 
 async function readMachine() {
@@ -273,15 +280,12 @@ async function readMachine() {
 async function startScan({ resume = false } = {}) {
     const s = state.s;
     const grid = gridOf(s);
-    const errs = validateGrid(grid);
-    if (s.depth >= s.clearance) errs.push('"Probe to Z" must be below the travel height');
-    if (!(s.feed > 0)) errs.push('Probe feed must be > 0');
+    const errs = [...validateGrid(grid), ...validateScanSettings(s)];
     if (errs.length) { setMsg('err', errs.join('\n')); return; }
 
-    let m, ctx;
+    let m;
     try {
         m = await readMachine();
-        ctx = await machine.getContext();
     } catch (e) {
         setMsg('err', e.message);
         return;
@@ -289,58 +293,37 @@ async function startScan({ resume = false } = {}) {
     if (!m.connected) { setMsg('err', 'Connect to the machine first.'); return; }
     if (m.activeState !== 'Idle') { setMsg('err', `Machine is ${m.activeState}. It must be Idle (unlock / home first).`); return; }
 
-    const mpos = ctx.position, wpos = ctx.workPosition;
-    if (!mpos || !wpos) { setMsg('err', 'Machine position is unknown.'); return; }
-    let wcoZ = Number(mpos.z) - Number(wpos.z);
-
-    if (!(resume && state.map && sameGrid(state.map, grid) && !isComplete(state.map))) {
+    if (!(resume && state.map && sameGrid(state.map, grid) && !isComplete(state.map) && Number.isFinite(state.map.z[0]))) {
         state.map = createHeightMap(grid);
         resume = false;
     }
     const map = state.map;
-    const pts = gridPoints(grid).filter((p) => !Number.isFinite(map.z[p.idx]));
-    const total = map.z.length;
 
     state.scanning = true;
     state.abort = false;
-    setMsg('info', resume ? `Resuming: ${pts.length} point(s) left` : `Scanning ${total} points…`);
+    setMsg('info', resume ? 'Resuming scan…' : `Scanning ${map.z.length} points…`);
     render();
-    const probeTimeout = 120000 + (Math.abs(s.clearance - s.depth) / s.feed) * 60000;
 
-    try {
-        await machine.setBusy(true, 'Autolevel scan');
-        await q('G21');
-        await q('G90');
-        await q(`G0 Z${fmt(s.clearance)}`);
-        for (const p of pts) {
-            if (state.abort) throw new Error('Scan stopped by user.');
+    const io = {
+        send: sendLine,
+        probePin,
+        aborted: () => state.abort,
+        sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+        log,
+        status: (text) => { setMsg('info', text); machine.setBusy(true, 'Autolevel scan').catch(() => {}); },
+        onPoint: (p, zw) => {
             state.current = p;
-            updateProgress();
-            drawOverlay();
-            machine.setBusy(true, 'Autolevel scan').catch(() => {});
-
-            await q(`G0 X${fmt(p.x)} Y${fmt(p.y)}`);
-            let prb = await probe(s.depth, s.feed, probeTimeout);
-            if (s.slowFeed > 0) {
-                const zc = prb.z - wcoZ;
-                await q(`G0 Z${fmt(zc + s.backoff)}`);
-                prb = await probe(zc - s.backoff - 1, s.slowFeed, probeTimeout);
-            }
-            let zw = prb.z - wcoZ;
-            if (p.idx === 0 && s.zeroFirst) {
-                await q('G10 L20 P0 Z0');
-                wcoZ = prb.z;
-                zw = 0;
-                log('Work Z zeroed at first point');
-            }
-            map.z[p.idx] = zw;
             log(`#${p.idx} X${fmt(p.x, 3)} Y${fmt(p.y, 3)} → Z${fmt(zw)}`);
-            await q(`G0 Z${fmt(s.clearance)}`);
             saveMap();
             updateProgress();
             renderHeat();
             drawOverlay();
-        }
+        },
+    };
+
+    try {
+        await machine.setBusy(true, 'Autolevel scan');
+        await runScan(io, s, map, gridPoints(grid), { resume, touchTest: s.probeTest });
         const st = mapStats(map);
         setMsg('ok', `Scan complete. Range ${fmt(st.range, 3)} mm (min ${fmt(st.min, 3)}, max ${fmt(st.max, 3)}).`);
         log('Scan complete');
@@ -382,17 +365,34 @@ async function refreshFile() {
     render();
 }
 
+function fileBoundsWith(m) {
+    const b = state.s.fileBbox;
+    return { xmin: round3(b.xmin - m), xmax: round3(b.xmax + m), ymin: round3(b.ymin - m), ymax: round3(b.ymax + m) };
+}
+
+function applyFileBounds() {
+    Object.assign(state.s, fileBoundsWith(state.s.margin || 0));
+}
+
+/** Re-applies a changed margin, but only while the area is still the one the file bounds produced. */
+function onMarginChange(oldMargin) {
+    if (!state.s.fileBbox) return;
+    const prev = fileBoundsWith(oldMargin || 0);
+    if (!['xmin', 'xmax', 'ymin', 'ymax'].every((k) => Math.abs(state.s[k] - prev[k]) < 1e-6)) return;
+    applyFileBounds();
+    saveSettings();
+    render();
+}
+
 async function useFileBounds() {
     try {
         const { file } = await readMachine();
         if (!file?.fileLoaded) { setMsg('err', 'No G-code file is loaded.'); return; }
         const { min, max } = file.bbox;
-        const m = state.s.margin || 0;
-        Object.assign(state.s, {
-            xmin: round3(min.x - m), xmax: round3(max.x + m), ymin: round3(min.y - m), ymax: round3(max.y + m),
-        });
+        state.s.fileBbox = { xmin: min.x, xmax: max.x, ymin: min.y, ymax: max.y };
+        applyFileBounds();
         saveSettings();
-        setMsg('info', `Grid set to file bounds ±${m} mm.`);
+        setMsg('info', `Grid set to file bounds ±${state.s.margin || 0} mm.`);
         render();
         drawOverlay();
     } catch (e) {
@@ -460,13 +460,18 @@ function importMap(text) {
 // Rendering
 // ---------------------------------------------------------------------------
 
-function num(key, label, { step = 'any', min, int = false } = {}) {
-    return h('label', { className: 'f' }, label,
+/** Small "?" marker that shows `tip` on hover. */
+const tipMark = (tip) => (tip ? h('span', { className: 'q', 'data-tip': tip, onClick: (e) => e.preventDefault() }, '?') : null);
+const tipLabel = (text, tip) => h('span', {}, text, tipMark(tip));
+
+function num(key, label, { step = 'any', min, int = false, tip, after } = {}) {
+    return h('label', { className: 'f' }, tipLabel(label, tip),
         h('input', {
             type: 'number', step, min, value: state.s[key], disabled: state.scanning,
             onChange: (e) => {
+                const old = state.s[key];
                 const v = int ? parseInt(e.target.value, 10) : parseFloat(e.target.value);
-                if (Number.isFinite(v)) { state.s[key] = v; saveSettings(); }
+                if (Number.isFinite(v)) { state.s[key] = v; saveSettings(); after?.(old); }
                 else e.target.value = state.s[key];
                 state.confirmApply = false;
                 updateDerived();
@@ -475,10 +480,10 @@ function num(key, label, { step = 'any', min, int = false } = {}) {
         }));
 }
 
-function chk(key, label, after) {
+function chk(key, label, after, tip) {
     return h('label', { className: 'chk' },
         h('input', { type: 'checkbox', checked: !!state.s[key], onChange: (e) => { state.s[key] = e.target.checked; saveSettings(); after?.(); } }),
-        label);
+        tipLabel(label, tip));
 }
 
 function renderMsg() {
@@ -497,7 +502,7 @@ function updateDerived() {
     const dx = (s.xmax - s.xmin) / (s.nx - 1);
     const dy = (s.ymax - s.ymin) / (s.ny - 1);
     const n = s.nx * s.ny;
-    const perPoint = (Math.abs(s.clearance - s.depth) / 2) / s.feed * 60 + (s.slowFeed > 0 ? (s.backoff * 2) / s.slowFeed * 60 : 0) + 2;
+    const perPoint = (s.clearance + s.maxBelow / 2) / s.feed * 60 + (s.slowFeed > 0 ? (s.backoff * 2) / s.slowFeed * 60 : 0) + 2;
     el.textContent = `${n} points, spacing ${fmt(dx, 2)} × ${fmt(dy, 2)} mm, ≈ ${Math.ceil((n * perPoint) / 60)} min`;
 }
 
@@ -605,26 +610,37 @@ function tabSetup() {
         h('div', { className: 'section' },
             h('h4', {}, 'Probe area (work coordinates, mm)'),
             h('div', { className: 'grid2' },
-                num('xmin', 'X min'), num('xmax', 'X max'),
-                num('ymin', 'Y min'), num('ymax', 'Y max'),
-                num('nx', 'X points', { step: 1, min: 2, int: true }), num('ny', 'Y points', { step: 1, min: 2, int: true })),
+                num('xmin', 'X min', { tip: 'Left edge of the probed area (work X, mm).' }),
+                num('xmax', 'X max', { tip: 'Right edge of the probed area (work X, mm).' }),
+                num('ymin', 'Y min', { tip: 'Front edge of the probed area (work Y, mm).' }),
+                num('ymax', 'Y max', { tip: 'Back edge of the probed area (work Y, mm).' }),
+                num('nx', 'X points', { step: 1, min: 2, int: true, tip: 'Probe points across X, including both edges. More points = finer map, longer scan.' }),
+                num('ny', 'Y points', { step: 1, min: 2, int: true, tip: 'Probe points across Y, including both edges. More points = finer map, longer scan.' })),
             h('div', { className: 'row' },
                 h('button', { className: 'b', disabled: state.scanning, onClick: useFileBounds }, 'Use loaded file bounds'),
-                h('div', { style: 'width:70px' }, num('margin', 'Margin'))),
+                tipMark('Set the probe area to the loaded G-code outline, expanded by Margin on every side.'),
+                h('div', { style: 'width:70px' }, num('margin', 'Margin', {
+                    after: onMarginChange,
+                    tip: 'Extra mm added around the job when using file bounds. Changing it updates the area while it still matches the file bounds. 0 or negative keeps probes on the board when the job runs to its edge.',
+                }))),
             h('div', { className: 'note', id: 'derived' })),
         h('div', { className: 'section' },
             h('h4', {}, 'Probing'),
             h('div', { className: 'grid2' },
-                num('clearance', 'Travel Z'), num('depth', 'Probe to Z'),
-                num('feed', 'Probe feed', { min: 1 }), num('slowFeed', 'Slow re-probe feed (0 = off)', { min: 0 }),
-                num('backoff', 'Re-probe back-off')),
-            chk('zeroFirst', 'Set work Z0 at first point'),
-            h('div', { className: 'note' }, 'Zero Z roughly on the surface and attach the probe clip before scanning. Travel and probe heights are work coordinates.')),
+                num('clearance', 'Travel height', { tip: 'How far (mm) above the first point\'s surface the bit travels between points (0.5–10). Must clear clamps.' }),
+                num('maxBelow', 'Max depth below first point', { tip: 'How far (mm) below the first point\'s surface any later probe may go before the scan stops (0.1–3). A board is never off by more than this.' }),
+                num('firstTravel', 'First probe max travel', { tip: 'The first probe searches down at most this far (mm) from where the bit starts (1–25). Start with the bit a few mm above the board.' }),
+                num('feed', 'Probe feed', { min: 1, tip: 'Feed (mm/min) of the first, fast probe move.' }),
+                num('slowFeed', 'Slow re-probe feed (0 = off)', { min: 0, tip: 'After contact, back off and probe again at this slower feed (mm/min) for a more accurate reading. 0 skips it.' }),
+                num('backoff', 'Re-probe back-off', { tip: 'How far (mm) to lift after the first contact before the slow re-probe.' })),
+            chk('zeroFirst', 'Set work Z0 at first point', null, 'Set work Z0 where the first point touches, so all heights are relative to it.'),
+            chk('probeTest', 'Touch-test the probe before scanning', null, 'Before anything moves, wait until you touch the probe lead to the bit, so a broken probe circuit is caught first.'),
+            h('div', { className: 'note' }, 'Jog the bit a few mm above the board and attach the probe clip. The scan finds the surface itself at the first point; the current Z0 is not used for any move.')),
         h('div', { className: 'section' },
             h('h4', {}, 'Visualizer'),
-            chk('showOverlay', 'Show grid / map on visualizer', drawOverlay),
-            chk('showLabels', 'Show height labels', drawOverlay),
-            chk('showMesh', 'Show interpolated mesh', drawOverlay),
+            chk('showOverlay', 'Show grid / map on visualizer', drawOverlay, 'Draw probe points (or the probed heights) in the gSender visualizer.'),
+            chk('showLabels', 'Show height labels', drawOverlay, 'Show each point\'s measured height next to it.'),
+            chk('showMesh', 'Show interpolated mesh', drawOverlay, 'Draw interpolated lines between points of a complete map.'),
             h('div', { className: 'row' },
                 h('button', { className: 'b', onClick: () => viewer.camera.set('top').catch(() => {}) }, 'Top view'),
                 h('button', { className: 'b', onClick: () => viewer.camera.set('3d').catch(() => {}) }, '3D view'))),
@@ -666,8 +682,8 @@ function tabApply() {
         h('div', { className: 'section' },
             h('h4', {}, 'Levelling'),
             h('div', { className: 'grid2' },
-                num('segment', 'Max segment (mm)', { min: 0.1 }),
-                h('label', { className: 'f' }, 'Z reference',
+                num('segment', 'Max segment (mm)', { min: 0.1, tip: 'Long moves are split into pieces no longer than this so Z can follow the surface. Smaller = more accurate, larger file.' }),
+                h('label', { className: 'f' }, tipLabel('Z reference', 'Which Z the height map is measured against when levelling.'),
                     h('select', {
                         onChange: (e) => { state.s.reference = e.target.value; saveSettings(); renderHeat(); drawOverlay(); },
                     },
@@ -697,12 +713,13 @@ function tabApply() {
 
 function render() {
     const root = $('#root');
-    const status = h('div', { className: 'note', id: 'conn' }, state.connected ? '● Connected' : '○ Not connected');
+    const status = h('div', { className: 'conn', id: 'conn' });
     const tabs = h('div', { className: 'tabs' },
         ...[['setup', 'Setup'], ['probe', 'Probe'], ['apply', 'Apply']].map(([id, label]) =>
             h('button', { className: state.tab === id ? 'active' : '', onClick: () => { state.tab = id; if (id === 'apply') refreshFile(); else render(); } }, label)));
     const body = state.tab === 'setup' ? tabSetup() : state.tab === 'probe' ? tabProbe() : tabApply();
     root.replaceChildren(tabs, status, h('div', { id: 'msg' }), ...body.filter(Boolean));
+    renderConn();
     renderMsg();
     updateDerived();
     updateProgress();
@@ -711,16 +728,83 @@ function render() {
     if (lg) lg.scrollTop = lg.scrollHeight;
 }
 
+/**
+ * Hover help for elements with `data-tip`, shown after a 1 s hover. Native
+ * `title` tooltips don't show inside gSender's plugin iframe, so one shared
+ * element is positioned on mouseover only (no per-move work).
+ */
+function setupTips() {
+    const tip = h('div', { className: 'hovertip' });
+    document.body.append(tip);
+    let cur = null;
+    let timer = 0;
+    const show = (el) => {
+        if (!el.isConnected) return;
+        tip.textContent = el.dataset.tip;
+        tip.style.display = 'block';
+        const r = el.getBoundingClientRect();
+        const w = tip.offsetWidth, ht = tip.offsetHeight;
+        const vw = document.documentElement.clientWidth, vh = document.documentElement.clientHeight;
+        tip.style.left = `${Math.max(4, Math.min(r.left, vw - w - 4))}px`;
+        tip.style.top = `${r.bottom + 4 + ht > vh ? Math.max(4, r.top - ht - 4) : r.bottom + 4}px`;
+    };
+    const hide = () => { clearTimeout(timer); tip.style.display = 'none'; };
+    document.addEventListener('mouseover', (e) => {
+        const el = e.target.closest?.('[data-tip]');
+        if (el === cur) return;
+        cur = el;
+        hide();
+        if (el) timer = setTimeout(() => show(el), 1000);
+    });
+    document.addEventListener('mouseleave', () => { cur = null; hide(); });
+}
+
 async function pollConnection() {
     try {
         const ctx = await machine.getContext();
         const c = !!ctx?.connected;
         if (c !== state.connected) {
             state.connected = c;
-            const el = $('#conn');
-            if (el) el.textContent = c ? '● Connected' : '○ Not connected';
+            renderConn();
         }
     } catch { /* bridge not ready */ }
+}
+
+/** Machine connection and live probe input, under the tabs. */
+function renderConn() {
+    const el = $('#conn');
+    if (!el) return;
+    const probe = !state.connected || state.probeOn === null
+        ? h('span', { className: 'pin' }, '○ Probe')
+        : state.probeOn ? h('span', { className: 'pin on' }, '● Probe touching') : h('span', { className: 'pin' }, '○ Probe open');
+    el.replaceChildren(h('span', { className: state.connected ? 'on' : '' }, state.connected ? '● Connected' : '○ Not connected'), probe);
+}
+
+// The panel is a visualizer overlay, loaded on every gSender page; read the
+// probe input (from gSender's machine state, ~30 KB a read) only while the
+// panel is on screen and the machine is connected.
+function panelVisible() {
+    if (document.hidden) return false;
+    try {
+        const f = window.frameElement;
+        return !f || f.getClientRects().length > 0;
+    } catch {
+        return true;
+    }
+}
+async function pollProbe() {
+    let next = 1000;
+    try {
+        if (state.connected && panelVisible()) {
+            next = 250;
+            const on = await probePin();
+            if (on !== state.probeOn) { state.probeOn = on; renderConn(); }
+        } else if (state.probeOn !== null) {
+            state.probeOn = null;
+            renderConn();
+        }
+    } catch { /* bridge not ready */ }
+    setTimeout(pollProbe, next);
 }
 
 async function init() {
@@ -734,12 +818,14 @@ async function init() {
     }
     if (state.map) state.tab = isComplete(state.map) ? 'apply' : 'probe';
     render();
+    setupTips();
     if (state.tab === 'apply') refreshFile();
     clipOverlayAroundPanel();
     excludeOverlayFromRecording();
     drawOverlay();
     pollConnection();
     setInterval(pollConnection, 2000);
+    pollProbe();
     window.addEventListener('resize', debounce(renderHeat, 150));
 }
 

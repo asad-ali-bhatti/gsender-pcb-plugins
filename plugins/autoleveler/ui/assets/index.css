@@ -6,6 +6,7 @@
     --border: #d0d7de;
     --accent: #0a9e78;
     --accent-text: #ffffff;
+    --ok: #1a7f37;
     --danger: #cf222e;
     --warn: #9a6700;
     --input: #ffffff;
@@ -19,6 +20,7 @@
     --border: #3a3f46;
     --accent: #0ef6ae;
     --accent-text: #0b1512;
+    --ok: #3fb950;
     --danger: #ff6b6b;
     --warn: #e3b341;
     --input: #15171a;
@@ -48,6 +50,9 @@ button.b.danger { background: var(--danger); color: #fff; border-color: var(--da
 button.b:disabled { opacity: .45; cursor: not-allowed; }
 
 .note { color: var(--muted); font-size: 11px; margin: 4px 0; }
+.conn { display: flex; gap: 12px; color: var(--muted); font-size: 11px; margin: 4px 0; }
+.conn .on { color: var(--accent); font-weight: 600; }
+.conn .pin.on { color: var(--ok); }
 .msg { padding: 6px 8px; border-radius: 4px; margin: 6px 0; background: var(--panel); border-left: 3px solid var(--muted); white-space: pre-wrap; word-break: break-word; }
 .msg.err { border-left-color: var(--danger); }
 .msg.warn { border-left-color: var(--warn); }
@@ -68,3 +73,5 @@ button.b:disabled { opacity: .45; cursor: not-allowed; }
 .legend .bar { flex: 1; height: 6px; margin: 4px 6px 0; border-radius: 3px; }
 
 .log { white-space: pre; max-height: 110px; overflow: auto; font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; background: var(--panel); border-radius: 4px; padding: 4px 6px; color: var(--muted); }
+.hovertip { display: none; position: fixed; z-index: 100; pointer-events: none; max-width: min(240px, calc(100vw - 8px)); background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; font-size: 11px; line-height: 1.35; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2); }
+.q { cursor: help; display: inline-flex; align-items: center; justify-content: center; width: 11px; height: 11px; margin-left: 4px; border: 1px solid currentColor; border-radius: 50%; font-size: 8px; font-weight: 600; line-height: 1; vertical-align: 1px; opacity: 0.7; }
