@@ -61,6 +61,9 @@ export function parseWcoZ(gLines, hashLines) {
  *   log(text), status(text)
  *   onPoint(p, zWork)                                   a point was measured
  *   sleep(ms)
+ *   readWcoZ?({ atCurrent }) -> Promise<number>         optional: work Z offset from the
+ *       controller's status reports (no $ commands); `atCurrent` means work Z0 was
+ *       just set at the current position. Without it, $G + $# are queried.
  * }
  * @param s     scan settings (validated with validateScanSettings)
  * @param map   height map; points with a finite z are skipped (resume)
@@ -102,7 +105,8 @@ export async function runScan(io, s, map, pts, { resume = false, touchTest = tru
         io.log(`< PRB Z${fmt(prb.z)} (machine)`);
         return prb;
     };
-    const readWcoZ = async () => {
+    const readWcoZ = async (atCurrent = false) => {
+        if (io.readWcoZ) return io.readWcoZ({ atCurrent });
         const g = await send('$G');
         const hash = await send('$#');
         const w = parseWcoZ(g, hash);
@@ -160,7 +164,7 @@ export async function runScan(io, s, map, pts, { resume = false, touchTest = tru
             await send('G10 L20 P0 Z0');
             io.log('Work Z zeroed at the first point');
         }
-        wcoZ = await readWcoZ();
+        wcoZ = await readWcoZ(!!s.zeroFirst);
         map.wcoZ = wcoZ;
         const zw = s.zeroFirst ? 0 : first.z - wcoZ;
         map.z[anchor.idx] = zw;

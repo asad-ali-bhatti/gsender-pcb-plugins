@@ -67,7 +67,8 @@ export function heightAt(map, x, y) {
     const z01 = z[(j0 + 1) * nx + i0];
     const z11 = z[(j0 + 1) * nx + i0 + 1];
     const v = z00 * (1 - tx) * (1 - ty) + z10 * tx * (1 - ty) + z01 * (1 - tx) * ty + z11 * tx * ty;
-    return { z: v, outside };
+    const beyond = Math.max(0, xmin - x, x - xmax, ymin - y, y - ymax);
+    return { z: v, outside, beyond };
 }
 
 /** Finds `[PRB:x,y,z(,a...):1]` in captured lines. Coordinates are machine coordinates. */
@@ -139,7 +140,7 @@ export function levelGcode(text, map, opts = {}) {
 
     const out = [];
     const warnings = new Set();
-    const stats = { inLines: 0, outLines: 0, levelled: 0, arcs: 0, outside: 0, skipped: 0 };
+    const stats = { inLines: 0, outLines: 0, levelled: 0, arcs: 0, outside: 0, beyond: 0, skipped: 0 };
 
     const st = {
         abs: true, absArc: false, inch: false, plane: 17, motion: null,
@@ -149,7 +150,7 @@ export function levelGcode(text, map, opts = {}) {
     const dec = () => (st.inch ? 5 : 4);
     const offsetAt = (x, y) => {
         const h = heightAt(map, toMm(x), toMm(y));
-        if (h.outside) stats.outside++;
+        if (h.beyond > 0.01) { stats.outside++; stats.beyond = Math.max(stats.beyond, h.beyond); }
         const off = h.z - refZ;
         return st.inch ? off / MM_PER_INCH : off;
     };
@@ -275,7 +276,7 @@ export function levelGcode(text, map, opts = {}) {
     }
 
     stats.outLines = out.length;
-    if (stats.outside > 0) warnings.add(`${stats.outside} point(s) fell outside the probed area (edge heights were used)`);
+    if (stats.outside > 0) warnings.add(`${stats.outside} point(s), up to ${fmt(stats.beyond, 2)} mm, lie outside the probed area; the nearest edge heights were used there`);
     return { gcode: out.join('\n'), stats, warnings: [...warnings] };
 }
 

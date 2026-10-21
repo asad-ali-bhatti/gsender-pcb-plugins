@@ -183,3 +183,16 @@ test('parseWcoZ uses the active WCS plus G92 and TLO', () => {
     assert.equal(parseWcoZ(['[GC:G0 G55 G17 G21 G90]'], hash), -9.25);
     assert.equal(parseWcoZ(['[GC:G0 G54]'], ['ok']), null);
 });
+
+test('grblHAL: work offset comes from status reports, no $ commands are sent', async () => {
+    const m = makeMachine({ surface: tilt, start: { x: 50, y: 50, z: -43 }, wcoZ: -46.2 });
+    const send = m.send;
+    m.send = (cmd) => (cmd.startsWith('$') ? Promise.resolve(['error:3']) : send(cmd));
+    const calls = [];
+    const map = createHeightMap(GRID);
+    await runScan({ ...io(m), readWcoZ: async (o) => { calls.push(o); return m.wco.z; } }, SETTINGS, map, gridPoints(GRID), { touchTest: false });
+    assert.deepEqual(m.crashes, []);
+    assert.ok(!m.sent.some((c) => c.startsWith('$')), 'no $ commands');
+    assert.deepEqual(calls, [{ atCurrent: true }]);
+    for (const p of gridPoints(GRID)) assert.ok(Math.abs(map.z[p.idx] - (tilt(p.x, p.y) - tilt(0, 0))) < 1e-6, `point ${p.idx}`);
+});

@@ -39,7 +39,9 @@ const state = {
     connected: false,
     probeOn: null,     // probe input triggered (live), null when unknown
     file: null,
-    confirmApply: false,
+    // Last un-levelled file we levelled, kept in memory only, so pressing Apply
+    // again (e.g. after a new scan) re-levels the original, never the output.
+    source: null,      // { name, content, leveledName }
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -255,12 +257,33 @@ async function sendLine(cmd, { probe = false, timeout = 10000 } = {}) {
     const r = await machine.query(cmd, { timeout, until: REPLY_RE, maxLines: 50 });
     let lines = r.lines;
     if (probe && !parsePRB(lines) && !lines.some((l) => /^(error:|ALARM:)/.test(l))) {
-        const more = await machine.query('G4 P0', { timeout, until: /^(\[PRB:|error:|ALARM:)/, maxLines: 50 });
+        // The probe was acknowledged before it finished: G4 P0 waits for it, so
+        // its reply holds the [PRB:] line and ends with its own ok (none left over).
+        const more = await machine.query('G4 P0', { timeout, until: REPLY_RE, maxLines: 50 });
         lines = lines.concat(more.lines);
-        await machine.query('G4 P0', { timeout: 10000, until: REPLY_RE }).catch(() => {});
     }
     if (!r.complete && !lines.some((l) => REPLY_RE.test(l))) throw new Error(`${cmd}: no response (${r.reason})`);
     return lines;
+}
+
+/**
+ * Work Z offset (machine Z of work Z0) from the WCO the controller reports in
+ * its status, without sending $ commands. Waits until the machine is Idle and
+ * the value is steady; with `atCurrent` (Z0 was just set here) also until the
+ * reported work Z reads 0, so a stale WCO from before G10 is never used.
+ */
+async function readWcoZ({ atCurrent = false } = {}) {
+    let last = null;
+    for (let waited = 0; waited < 5000; waited += 250) {
+        const st = (await getReduxState())?.controller?.state?.status ?? {};
+        const wco = Number(st.wco?.z);
+        const wz = Number(st.wpos?.z);
+        const ready = st.activeState === 'Idle' && Number.isFinite(wco) && (!atCurrent || Math.abs(wz) < 0.005);
+        if (ready && last !== null && Math.abs(wco - last) < 1e-4) return wco;
+        last = ready ? wco : null;
+        await new Promise((r) => setTimeout(r, 250));
+    }
+    throw new Error('Could not read the work offset (WCO) from the controller status.');
 }
 
 async function probePin() {
@@ -307,6 +330,7 @@ async function startScan({ resume = false } = {}) {
     const io = {
         send: sendLine,
         probePin,
+        readWcoZ,
         aborted: () => state.abort,
         sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
         log,
@@ -406,19 +430,22 @@ async function applyLevel() {
     await refreshFile();
     const f = state.file;
     if (!f) { setMsg('err', 'Load the G-code job first, then apply.'); return; }
-    if (f.content.includes('(Autoleveled by') && !state.confirmApply) {
-        state.confirmApply = true;
-        setMsg('warn', 'This file is already levelled. Click Apply again to level it a second time.');
-        render();
-        return;
+    let src = f;
+    if (f.content.includes('(Autoleveled by')) {
+        if (!state.source || state.source.leveledName.toLowerCase() !== String(f.name).toLowerCase()) {
+            setMsg('err', `${f.name} is already levelled. Levelling it again would apply the height map twice. Load the original G-code file and press Apply.`);
+            render();
+            return;
+        }
+        src = state.source;
     }
-    state.confirmApply = false;
     try {
-        const r = levelGcode(f.content, state.map, { segment: state.s.segment, reference: state.s.reference });
-        const name = String(f.name || 'job.nc').replace(/(\.[^.]+)?$/, (ext) => `_leveled${ext || '.nc'}`);
+        const r = levelGcode(src.content, state.map, { segment: state.s.segment, reference: state.s.reference });
+        const name = String(src.name || 'job.nc').replace(/(\.[^.]+)?$/, (ext) => `_leveled${ext || '.nc'}`);
         await gcode.loadToVisualizer(r.gcode, name);
+        state.source = { name: src.name, content: src.content, leveledName: name };
         const w = r.warnings.length ? `\n⚠ ${r.warnings.join('\n⚠ ')}` : '';
-        setMsg(r.warnings.length ? 'warn' : 'ok', `Loaded ${name}: ${r.stats.levelled} levelled moves (${r.stats.arcs} arcs linearised).${w}`);
+        setMsg(r.warnings.length ? 'warn' : 'ok', `${src === f ? '' : `Re-levelled the original ${src.name}. `}Loaded ${name}: ${r.stats.levelled} levelled moves (${r.stats.arcs} arcs linearised).${w}`);
         log(`Applied map → ${name}`);
         setTimeout(refreshFile, 1500);
     } catch (e) {
@@ -473,7 +500,6 @@ function num(key, label, { step = 'any', min, int = false, tip, after } = {}) {
                 const v = int ? parseInt(e.target.value, 10) : parseFloat(e.target.value);
                 if (Number.isFinite(v)) { state.s[key] = v; saveSettings(); after?.(old); }
                 else e.target.value = state.s[key];
-                state.confirmApply = false;
                 updateDerived();
                 drawOverlay();
             },
@@ -670,8 +696,13 @@ function tabApply() {
     let coverage = null;
     if (f && map) {
         const { min, max } = f.bbox;
-        const out = min.x < map.xmin - 0.01 || max.x > map.xmax + 0.01 || min.y < map.ymin - 0.01 || max.y > map.ymax + 0.01;
-        if (out) coverage = h('div', { className: 'msg warn' }, `Job (X${fmt(min.x, 2)}..${fmt(max.x, 2)} Y${fmt(min.y, 2)}..${fmt(max.y, 2)}) extends past the probed area; edge heights will be used there.`);
+        const beyond = Math.max(map.xmin - min.x, max.x - map.xmax, map.ymin - min.y, max.y - map.ymax);
+        if (beyond > 0.01) {
+            coverage = h('div', { className: 'msg warn' },
+                `Job (X${fmt(min.x, 2)}..${fmt(max.x, 2)} Y${fmt(min.y, 2)}..${fmt(max.y, 2)}) reaches up to ${fmt(beyond, 2)} mm past the probed area `
+                + `(X${fmt(map.xmin, 2)}..${fmt(map.xmax, 2)} Y${fmt(map.ymin, 2)}..${fmt(map.ymax, 2)}); the nearest edge heights are used there. `
+                + 'Fine for a cutout or drilling. For copper jobs, probe again with Margin set to at least that distance.');
+        }
     }
     return [
         h('div', { className: 'section' },
