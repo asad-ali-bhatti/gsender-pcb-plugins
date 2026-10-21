@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/logo.jpg" alt="PCB CAM, plugin for gSender" width="420">
+</p>
+
 # gSender PCB Plugins
 
 Plugins for [gSender](https://github.com/Sienci-Labs/gsender) that turn a hobby CNC into a PCB mill: probe and level the board, then (planned) generate isolation, drilling and cutout toolpaths without leaving gSender. Two independent plugins: **Autoleveler** for probing and levelling, and **PCB CAM** (planned), one place for the whole fabrication process from Gerber files to G-code, bringing the PCB features of [FlatCAM](http://flatcam.org/) into gSender.
@@ -70,3 +74,5 @@ A single full-featured plugin that turns Gerber and Excellon files into G-code. 
 ## License
 
 MIT. See [LICENSE](LICENSE). gSender is GPL-3.0 and is not included here; the plugins talk to it only through its plugin API.
+
+This project is not affiliated with or endorsed by Sienci Labs. gSender is a trademark of Sienci Labs.
