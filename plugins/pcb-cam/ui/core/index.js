@@ -10,5 +10,7 @@ export { inspectBoard } from './inspect.js';
 export { boardFromOutline } from './board.js';
 export { regionMask, shapeMask } from './regions.js';
 export { generate, resolveFaces } from './plan.js';
+export { multiDepth } from './ops/common.js';
+export { drillMethod } from './ops/drilling.js';
 export { emitGrbl } from './gcode/grbl.js';
 export { narrowGaps, analyzeProject, suggestRegions } from './analysis/index.js';

@@ -14,6 +14,16 @@ export const PATH_TOLERANCE = 0.002;
 /** Vertices closer than this are merged in toolpaths, mm. */
 export const PATH_CLEAN = 0.001;
 
+/** Whether `op` cuts in several passes; unset means on only for the through-board cuts (cutout, milled holes). */
+export function multiDepth(op) {
+    return op.multiDepth ?? (op.type === 'cutout' || op.type === 'drilling');
+}
+
+/** Max depth per pass for `op`: the tool's stepdown with multi-depth on, else the full `depth` in one pass. */
+export function passDepth(op, cutting, depth) {
+    return multiDepth(op) ? cutting.stepdown : depth;
+}
+
 /** Evenly spaced depth levels down to `depth` (positive), at most `stepdown` apart. Returns negative Z values. */
 export function depthLevels(depth, stepdown) {
     const n = Math.max(1, Math.ceil(depth / stepdown - 1e-9));

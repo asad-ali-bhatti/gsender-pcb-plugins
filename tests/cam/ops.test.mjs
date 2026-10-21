@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const C = await import(new URL('../../plugins/pcb-cam/ui/core/index.js', import.meta.url));
 const { geometry: G } = C;
-const { depthLevels, orderNearest, clipRings } = await import(new URL('../../plugins/pcb-cam/ui/core/ops/common.js', import.meta.url));
+const { depthLevels, orderNearest, clipRings, passDepth } = await import(new URL('../../plugins/pcb-cam/ui/core/ops/common.js', import.meta.url));
 
 const near = (a, b, eps, msg) => assert.ok(Math.abs(a - b) <= eps, `${msg ?? ''} expected ${b} ± ${eps}, got ${a}`);
 const c = (v) => String(Math.round(v * 1e6));
@@ -191,6 +191,11 @@ test('depth levels and nearest-neighbour ordering', () => {
     assert.deepEqual(depthLevels(0.05, 0.1), [-0.05]);
     assert.deepEqual(depthLevels(1.8, 0.6).map((z) => +z.toFixed(9)), [-0.6, -1.2, -1.8]);
     assert.equal(depthLevels(1.0, 0.3).length, 4);
+    const cut = { stepdown: 0.1 };
+    assert.equal(passDepth({ type: 'isolation' }, cut, 0.3), 0.3, 'isolation defaults to one pass');
+    assert.equal(passDepth({ type: 'cutout' }, cut, 1.8), 0.1, 'cutout defaults to multi-depth');
+    assert.equal(passDepth({ type: 'isolation', multiDepth: true }, cut, 0.3), 0.1);
+    assert.equal(passDepth({ type: 'cutout', multiDepth: false }, cut, 1.8), 1.8);
     const sq = (x) => [[x, 0], [x + 1, 0], [x + 1, 1], [x, 1]];
     const r = orderNearest([{ loop: sq(10) }, { line: [[5, 0], [6, 0]] }, { loop: sq(2) }], [0, 0]);
     assert.deepEqual(r.items.map((i) => i.points[0]), [[2, 0], [5, 0], [10, 0]], 'nearest first, loops start at the nearest vertex');
@@ -292,6 +297,49 @@ test('drilling: drill plunges and pecks, end mill helix-mills and slots, filters
     near(Math.min(...helix.points.map((q) => q[2])), -1.8, 1e-9);
     assert.ok(signedArea(helix.points.slice(0, 20)) > 0, 'counter-clockwise = climb inside a hole');
     assert.ok(mill.cuts.some((c2) => c2.kind === 'drill' && c2.x === 28), 'NPTH 1 mm hole plunged with the 1 mm end mill');
+    // Method Drill with an end mill: every hole plunged, even the 3 mm one; slots skipped
+    const dr = generate(project([{ ...MILL, method: 'drill' }]));
+    const dcuts = dr.operations[0].cuts;
+    assert.ok(dcuts.every((c2) => c2.kind === 'drill'), 'no helix or slot paths');
+    assert.ok(dcuts.some((c2) => Math.hypot(c2.x - 15, c2.y - 15) < 1e-6), '3 mm hole plunged at its centre');
+    assert.ok(dr.issues.some((i) => i.code === 'drill-size-mismatch' && /undersize/.test(i.message)));
+    const drAll = generate(project([{ ...MILL, method: 'drill', minDiameter: 0 }]));
+    assert.ok(drAll.issues.some((i) => i.code === 'slot-needs-endmill' && /Method to Mill/.test(i.message)));
+    assert.ok(drAll.issues.some((i) => i.code === 'drill-size-mismatch' && /oversize/.test(i.message)), '0.8 mm holes plunged with the 1 mm end mill');
+    // preview marks: how each hole is cut, in the same coordinates as the cuts
+    const mk = generate(project([{ ...MILL, minDiameter: 0 }])).operations[0].marks;
+    const big = mk.find((k) => Math.hypot(k.x - 15, k.y - 15) < 1e-6);
+    assert.deepEqual([big.how, big.d], ['milled', 3]);
+    assert.ok(mk.some((k) => k.how === 'plunged' && k.x === 28), '1 mm hole plunged with the 1 mm end mill');
+    assert.ok(mk.filter((k) => k.how === 'skipped').length >= 3, '0.8 mm holes and slot are smaller than the tool');
+    assert.ok(generate(project([{ ...MILL, method: 'drill' }])).operations[0].marks.every((k) => k.how === 'plunged'));
+    assert.equal(C.drillMethod({}, { type: 'drill' }), 'drill');
+    assert.equal(C.drillMethod({ method: 'mill' }, { type: 'drill' }), 'drill', 'drill bits cannot mill');
+    assert.equal(C.drillMethod({}, { type: 'endmill' }), 'mill');
+    // pecking also lifts out of helix-milled holes
+    const pk = generate(project([{ ...MILL, peck: 0.5 }]));
+    const pieces = pk.operations[0].cuts.filter((c2) => c2.kind === 'path' && c2.points.every((q) => Math.hypot(q[0] - 15, q[1] - 15) < 1 + 1e-6));
+    assert.equal(pieces.length, 4, '1.8 mm helix in 0.5 mm pecks');
+    for (const [k, p2] of pieces.entries()) {
+        const top = p2.points[0][2];
+        assert.ok(top - Math.min(...p2.points.map((q) => q[2])) <= 0.5 + 1e-6, `piece ${k} no deeper than one peck`);
+        if (k) { near(p2.reenter, top, 1e-9); assert.deepEqual(p2.points[0], pieces[k - 1].points.at(-1)); }
+    }
+    near(Math.min(...pieces.at(-1).points.map((q) => q[2])), -1.8, 1e-9);
+    const pg = pk.files[0].gcode;
+    assert.match(pg, /G0 Z1\nG0 Z-0\.\d+\nG1 Z-0\.\d+ F/, 'lift to travel Z, rapid back to just above the cut, then feed in');
+    checkGcode(pg, { safeZ: 5, travelZ: 1, minZ: -1.8 });
+    // a tight helix (hole barely bigger than the tool) never descends faster than the plunge rate
+    const tight = generate(project([{ ...MILL, minDiameter: 0.95, maxDiameter: 1.1 }], { tools: [{ ...TOOLS.em1, diameter: 0.9 }] }));
+    let at = {}, feed = 0, fastest = 0;
+    for (const l of (tight.files?.[0]?.gcode ?? '').split('\n')) {
+        const w = Object.fromEntries([...l.matchAll(/([XYZF])(-?[\d.]+)/g)].map((m) => [m[1], Number(m[2])]));
+        if (w.F) feed = w.F;
+        const nx = { X: w.X ?? at.X, Y: w.Y ?? at.Y, Z: w.Z ?? at.Z };
+        if (l.startsWith('G1') && nx.Z < at.Z) fastest = Math.max(fastest, feed * (at.Z - nx.Z) / Math.hypot(nx.X - at.X, nx.Y - at.Y, at.Z - nx.Z));
+        at = nx;
+    }
+    assert.ok(fastest > 0 && fastest <= TOOLS.em1.cutting.plunge + 1, `descends at ${fastest} mm/min`);
     // without the size filter, the 0.8 mm holes and slot are narrower than the 1 mm end mill
     const small = generate(project([{ ...MILL, minDiameter: 0 }]));
     assert.match(small.issues.find((i) => i.code === 'hole-smaller-than-tool').message, /^3 hole\(s\)\/slot\(s\) of ⌀0.8 mm/);

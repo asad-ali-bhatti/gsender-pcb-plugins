@@ -14,6 +14,11 @@ export const DEFAULT_TOOLS = [
         notes: 'Fine pitch only (fragile). Keep feed ≈ RPM × 0.006 mm.',
     },
     {
+        id: 'vbit-15-0.1', name: 'V-bit 15° 0.1 mm', type: 'vbit', toolNumber: 7, tipDiameter: 0.1, angle: 15, maxDepth: 0.3,
+        cutting: { feed: 120, plunge: 25, rpm: 28000, stepdown: 0.1 },
+        notes: 'Finest isolation: width grows slowly with depth, so uneven boards change it least. Very fragile; level the board first.',
+    },
+    {
         id: 'em-0.8', name: 'End mill 0.8 mm', type: 'endmill', toolNumber: 3, diameter: 0.8, maxDepth: 4,
         cutting: { feed: 150, plunge: 40, rpm: 24000, stepdown: 0.4 },
         notes: 'Holes ≥ 0.8 mm (plunged or helix-milled) and board cutout.',

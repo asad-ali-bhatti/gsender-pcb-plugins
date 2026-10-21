@@ -72,6 +72,15 @@ export function emitGrbl(job, { title } = {}) {
         grow(pos.x, pos.y);
     };
 
+    // Feed for a cutting move: slowed when it goes down so its vertical speed
+    // never exceeds the plunge rate (a tight helix is otherwise a fast plunge).
+    const descentFeed = (x, y, z, f, pf) => {
+        const dz = pos.z - z;
+        if (!(dz > 0)) return f;
+        const len = Math.hypot(x - pos.x, y - pos.y, dz);
+        return f * dz / len > pf ? Math.max(1, Math.round(pf * len / dz)) : f;
+    };
+
     comment(title ?? `PCB CAM: ${job.name}`);
     comment('Units mm, Z0 = copper surface / stock top');
     const used = [...new Map(steps.map((s) => [s.tool.id, s.tool])).values()];
@@ -140,11 +149,12 @@ export function emitGrbl(job, { title } = {}) {
                 continue;
             }
             const pts = cut.points;
+            // A peck re-entry rapids back down to just above the depth already cut.
+            if (cut.reenter !== undefined) rapid(undefined, undefined, Math.min(setup.travelZ, cut.reenter + PECK_CLEARANCE));
             linear(undefined, undefined, pts[0][2], pf);
             for (let i = 1; i < pts.length; i++) {
                 const [x, y, z] = pts[i];
-                const zOnly = x === pos.x && y === pos.y;
-                linear(x, y, z, zOnly && z < pos.z ? pf : f);
+                linear(x, y, z, descentFeed(x, y, z, f, pf));
             }
             rapid(undefined, undefined, setup.travelZ);
         }

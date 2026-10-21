@@ -2,7 +2,7 @@
 // with holding tabs on the outer edge.
 
 import * as G from '../geometry.js';
-import { clipRings, cutsAtLevels, depthLevels, offsetRings, orderNearest, reversed, rings } from './common.js';
+import { clipRings, cutsAtLevels, depthLevels, offsetRings, orderNearest, passDepth, reversed, rings } from './common.js';
 
 export function cutout({ op, tool, cutting, board, mask, project, from, mirror }) {
     const issues = [];
@@ -22,7 +22,7 @@ export function cutout({ op, tool, cutting, board, mask, project, from, mirror }
     else ringList = ringList.map((p) => (outer.has(p) ? markOuter(p) : p));
 
     const depth = project.setup.stockThickness + op.breakthrough;
-    const levels = depthLevels(depth, cutting.stepdown);
+    const levels = depthLevels(depth, passDepth(op, cutting, depth));
     const { loops, lines } = clipRings(ringList, mask);
     const ordered = orderNearest([...loops.map((loop) => ({ loop, outer: loop.outer })), ...lines.map((line) => ({ line }))], from);
     const tabTop = -project.setup.stockThickness + op.tabs.height;

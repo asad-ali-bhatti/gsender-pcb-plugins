@@ -190,3 +190,12 @@ table.t td.n, table.t th.n { text-align: right; font-variant-numeric: tabular-nu
 .dialog h3 { margin: 0 0 6px; font-size: 14px; }
 .dialog p { margin: 0 0 12px; color: var(--muted); }
 .dialog .row { justify-content: flex-end; }
+
+/* Load-into-gSender feedback */
+.b.done { filter: saturate(0.6); }
+.toast { position: fixed; left: 50%; top: 56px; transform: translate(-50%, -8px); max-width: min(520px, calc(100% - 32px)); padding: 8px 14px; border-radius: 6px; background: var(--panel); color: var(--text); border: 1px solid var(--border); box-shadow: 0 4px 16px rgb(0 0 0 / 0.25); font-size: 13px; opacity: 0; pointer-events: none; transition: opacity 0.15s, transform 0.15s; z-index: 50; }
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+.toast.ok { border-color: var(--accent); }
+.toast.err { border-color: var(--danger); color: var(--danger); }
+.kv .legend { grid-column: 1 / -1; }
+.legend .bad { color: #e5534b; }

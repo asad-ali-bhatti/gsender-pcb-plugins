@@ -103,7 +103,7 @@ export function generate(project, layers, { toolChangeOption, only } = {}) {
             removed.set(op.input, G.union(removed.get(op.input) ?? [], cut));
         }
         if (r.cuts.length) from = r.end;
-        results.push({ op, tool, cutting, face: faces[op.id], cuts: r.cuts, extra: { holes: r.holes, tabs: r.tabs, width: r.width } });
+        results.push({ op, tool, cutting, face: faces[op.id], cuts: r.cuts, marks: r.marks, extra: { holes: r.holes, breakdown: r.breakdown, tabs: r.tabs, width: r.width } });
     }
     if (issues.some((i) => i.severity === 'error')) return { ok: false, issues };
 
@@ -132,6 +132,7 @@ export function generate(project, layers, { toolChangeOption, only } = {}) {
             // mirroring restores climb / conventional.
             return { ...c, points: c.points.map(([x, y, z]) => [...m(x, y), z]) };
         });
+        if (r.marks) r.marks = r.marks.map((k) => { const [x, y] = m(k.x, k.y); return { ...k, x, y }; });
     }
 
     const steps = results.filter((r) => r.cuts.length);
@@ -173,6 +174,7 @@ export function generate(project, layers, { toolChangeOption, only } = {}) {
         tool: r.tool.id,
         face: r.face,
         cuts: r.cuts,
+        ...(r.marks ? { marks: r.marks } : {}),
         stats: opStats(r),
     }));
     const total = files.reduce((a, f) => ({ minutes: a.minutes + f.stats.minutes, cutLength: a.cutLength + f.stats.cutLength }), { minutes: 0, cutLength: 0 });
@@ -195,6 +197,7 @@ function opStats(r) {
     }
     const s = { cuts: r.cuts.length, cutLength: round(cutLength, 1), minutes: round(cutLength / r.cutting.feed, 1), minZ: round(minZ) };
     if (r.extra.holes !== undefined) s.holes = r.extra.holes;
+        if (r.extra.breakdown) s.breakdown = r.extra.breakdown;
     if (r.extra.tabs !== undefined) s.tabs = r.extra.tabs;
     if (r.extra.width !== undefined) s.width = round(r.extra.width);
     return s;

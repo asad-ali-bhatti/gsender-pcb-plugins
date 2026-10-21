@@ -4,7 +4,7 @@
 
 import { widthAtDepth } from '../tools.js';
 import * as G from '../geometry.js';
-import { PATH_TOLERANCE, clipRings, cutsAtLevels, depthLevels, orderNearest, reversed, rings } from './common.js';
+import { PATH_TOLERANCE, clipRings, cutsAtLevels, depthLevels, orderNearest, passDepth, reversed, rings } from './common.js';
 
 /** Safety cap on concentric passes. */
 const MAX_RINGS = 5000;
@@ -42,7 +42,7 @@ export function clearing({ op, tool, cutting, layer, mask, board, removed, from,
         lines.push(...clipped.lines);
     }
     if (count >= MAX_RINGS) issues.push({ severity: 'warning', code: 'clearing-truncated', message: `Clearing "${op.id}" stopped after ${MAX_RINGS} passes`, opId: op.id });
-    const levels = depthLevels(op.depth, cutting.stepdown);
+    const levels = depthLevels(op.depth, passDepth(op, cutting, op.depth));
     const ordered = orderNearest([...loops.map((loop) => ({ loop })), ...lines.map((line) => ({ line }))], from);
     const cuts = ordered.items.flatMap((item) => cutsAtLevels(item, levels));
     if (!cuts.length) issues.push({ severity: 'warning', code: 'empty-operation', message: `Clearing "${op.id}" produced no toolpaths`, opId: op.id });

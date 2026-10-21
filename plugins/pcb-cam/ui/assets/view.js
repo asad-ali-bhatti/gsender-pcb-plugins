@@ -53,7 +53,8 @@ export function toolpathPath(op, transform) {
         if (c.kind === 'drill') { drills.push([fx(c.x), fy(c.y)]); continue; }
         c.points.forEach(([x, y], i) => (i ? lines.lineTo(fx(x), fy(y)) : lines.moveTo(fx(x), fy(y))));
     }
-    return { lines, drills };
+    const marks = (op.marks ?? []).map((k) => ({ ...k, x: fx(k.x), y: fy(k.y) }));
+    return { lines, drills, marks };
 }
 
 export function createView(container, { onClick, onRect, onMove } = {}) {
@@ -65,6 +66,34 @@ export function createView(container, { onClick, onRect, onMove } = {}) {
     let mode = 'pan';
     let drawing = null;
     let frame = 0;
+
+    // Drilling preview: + plunged, dashed circle milled to size, red slash skipped.
+    const drawHoleMarks = (marks, color, px) => {
+        ctx.lineWidth = 1.5 * px;
+        for (const k of marks) {
+            const r = k.d / 2;
+            ctx.beginPath();
+            if (k.how === 'plunged') {
+                ctx.strokeStyle = color;
+                const c = r * 0.7;
+                ctx.moveTo(k.x - c, k.y); ctx.lineTo(k.x + c, k.y);
+                ctx.moveTo(k.x, k.y - c); ctx.lineTo(k.x, k.y + c);
+                ctx.stroke();
+            } else if (k.how === 'milled') {
+                ctx.strokeStyle = color;
+                ctx.setLineDash([3 * px, 2 * px]);
+                ctx.arc(k.x, k.y, r, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.setLineDash([]);
+            } else {
+                ctx.strokeStyle = '#e5534b';
+                ctx.arc(k.x, k.y, r, 0, Math.PI * 2);
+                const c = r * Math.SQRT1_2;
+                ctx.moveTo(k.x - c, k.y - c); ctx.lineTo(k.x + c, k.y + c);
+                ctx.stroke();
+            }
+        }
+    };
 
     const size = () => {
         const r = canvas.getBoundingClientRect();
@@ -190,6 +219,7 @@ export function createView(container, { onClick, onRect, onMove } = {}) {
                 for (const [x, y] of drills) { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, Math.PI * 2); }
                 ctx.stroke();
             }
+            if (t.path.marks?.length) drawHoleMarks(t.path.marks, t.color, px);
         }
 
         if (scene.highlight) {

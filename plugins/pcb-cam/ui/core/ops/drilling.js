@@ -3,7 +3,7 @@
 
 import * as G from '../geometry.js';
 import { isPlated } from '../import/excellon.js';
-import { PATH_TOLERANCE, cutsAtLevels, depthLevels, offsetRings, orderNearest, reversed, round } from './common.js';
+import { PATH_TOLERANCE, cutsAtLevels, depthLevels, offsetRings, orderNearest, passDepth, reversed, round } from './common.js';
 
 /** Hole and tool diameters closer than this count as the same size, mm. */
 export const SIZE_TOL = 0.05;
@@ -26,6 +26,16 @@ export function selectHoles(op, layer, mask) {
     };
 }
 
+/**
+ * How a drilling operation cuts holes: 'drill' plunges every hole straight down
+ * whatever its size; 'mill' plunges holes the tool's size and helix-mills bigger
+ * ones and slots. Drill bits can only drill. Default: by tool type.
+ */
+export function drillMethod(op, tool) {
+    if (tool?.type === 'drill') return 'drill';
+    return op.method ?? 'mill';
+}
+
 export function drilling({ op, tool, cutting, layer, mask, project, from, mirror }) {
     const issues = [];
     const depth = project.setup.stockThickness + op.breakthrough;
@@ -37,24 +47,32 @@ export function drilling({ op, tool, cutting, layer, mask, project, from, mirror
     const slotsSkipped = [];
     const items = [];
 
+    const method = drillMethod(op, tool);
+    // How each hole is cut, for the preview: plunged / milled / skipped.
+    const marks = [];
     for (const h of holes) {
         const diff = h.diameter - tool.diameter;
-        if (tool.type === 'drill' || Math.abs(diff) <= PLUNGE_TOL) {
-            if (tool.type === 'drill' && Math.abs(diff) > SIZE_TOL) mismatch.set(round(h.diameter, 3), (mismatch.get(round(h.diameter, 3)) ?? 0) + 1);
+        if (method === 'drill' || Math.abs(diff) <= PLUNGE_TOL) {
+            if (method === 'drill' && Math.abs(diff) > SIZE_TOL) mismatch.set(round(h.diameter, 3), (mismatch.get(round(h.diameter, 3)) ?? 0) + 1);
             items.push({ line: [[h.x, h.y]], drill: true });
+            marks.push({ x: h.x, y: h.y, d: tool.diameter, how: 'plunged' });
         } else if (diff < 0) {
             tooSmall.set(round(h.diameter, 3), (tooSmall.get(round(h.diameter, 3)) ?? 0) + 1);
+            marks.push({ x: h.x, y: h.y, d: h.diameter, how: 'skipped' });
         } else {
             items.push({ line: [[h.x, h.y]], helix: { r: (h.diameter - tool.diameter) / 2 } });
+            marks.push({ x: h.x, y: h.y, d: h.diameter, how: 'milled' });
         }
     }
     for (const s of slots) {
-        if (tool.type === 'drill') {
+        if (method === 'drill') {
             slotsSkipped.push(s);
+            marks.push({ x: s.path[0][0], y: s.path[0][1], d: s.diameter, how: 'skipped' });
             continue;
         }
         if (s.diameter < tool.diameter - PLUNGE_TOL) {
             tooSmall.set(round(s.diameter, 3), (tooSmall.get(round(s.diameter, 3)) ?? 0) + 1);
+            marks.push({ x: s.path[0][0], y: s.path[0][1], d: s.diameter, how: 'skipped' });
             continue;
         }
         if (s.diameter - tool.diameter <= PLUNGE_TOL) {
@@ -72,10 +90,11 @@ export function drilling({ op, tool, cutting, layer, mask, project, from, mirror
     }
     if (slotsSkipped.length) {
         const sizes = [...new Set(slotsSkipped.map((s) => round(s.diameter, 3)))].join(', ');
-        issues.push({ severity: 'warning', code: 'slot-needs-endmill', message: `${slotsSkipped.length} slot(s) (⌀${sizes} mm) skipped: slots need an end mill`, opId: op.id, at: slotsSkipped[0].path[0] });
+        const why = tool.type === 'drill' ? 'slots need an end mill' : 'set Method to Mill to cut slots';
+        issues.push({ severity: 'warning', code: 'slot-needs-endmill', message: `${slotsSkipped.length} slot(s) (⌀${sizes} mm) skipped: ${why}`, opId: op.id, at: slotsSkipped[0].path[0] });
     }
     for (const [d, n] of mismatch) {
-        issues.push({ severity: 'warning', code: 'drill-size-mismatch', message: `${n} hole(s) of ⌀${d} mm drilled with the ⌀${tool.diameter} mm drill "${tool.id}"`, opId: op.id });
+        issues.push({ severity: 'warning', code: 'drill-size-mismatch', message: `${n} hole(s) of ⌀${d} mm drilled with the ⌀${tool.diameter} mm ${tool.type === 'drill' ? 'drill' : 'end mill'} "${tool.id}"${d > tool.diameter ? ' (undersize; Method Mill cuts them to size)' : ' (oversize)'}`, opId: op.id });
     }
     for (const [d, n] of tooSmall) {
         issues.push({ severity: 'warning', code: 'hole-smaller-than-tool', message: `${n} hole(s)/slot(s) of ⌀${d} mm skipped: smaller than the ⌀${tool.diameter} mm tool "${tool.id}"`, opId: op.id });
@@ -83,22 +102,56 @@ export function drilling({ op, tool, cutting, layer, mask, project, from, mirror
     if (!items.length) issues.push({ severity: 'warning', code: 'empty-operation', message: `Drilling "${op.id}" selected no holes`, opId: op.id });
 
     const ordered = orderNearest(items, from);
-    const levels = depthLevels(depth, cutting.stepdown);
+    const step = passDepth(op, cutting, depth);
+    const levels = depthLevels(depth, step);
     const cuts = [];
     let count = 0;
+    let plunged = 0;
+    let milled = 0;
     for (const item of ordered.items) {
         const [x, y] = item.points[0];
         if (item.drill) {
             cuts.push({ kind: 'drill', x, y, z, peck });
             count++;
+            plunged++;
         } else if (item.helix) {
-            cuts.push(helix(x, y, item.helix.r, depth, cutting.stepdown, mirror ? -1 : 1));
+            milled++;
+            const hx = helix(x, y, item.helix.r, depth, step, mirror ? -1 : 1);
+            cuts.push(...(peck > 0 ? peckPath(hx.points, peck) : [hx]));
             count++;
         } else {
             cuts.push(...cutsAtLevels(item, levels));
         }
     }
-    return { cuts, holes: count, end: ordered.end, issues };
+    return { cuts, holes: count, marks, breakdown: { plunged, milled, skipped: [...tooSmall.values()].reduce((a, b) => a + b, 0) }, end: ordered.end, issues };
+}
+
+/**
+ * Splits a descending path into pieces at most `peck` deeper than where they
+ * start, so the tool lifts out between them to clear chips. Later pieces carry
+ * `reenter`: the depth already cut, which the emitter rapids back down to.
+ */
+export function peckPath(points, peck) {
+    const bottom = Math.min(...points.map((p) => p[2]));
+    const pieces = [];
+    let cur = [points[0]];
+    let next = points[0][2] - peck;
+    for (let i = 1; i < points.length; i++) {
+        const a = points[i - 1];
+        const b = points[i];
+        // Split exactly where the path crosses each peck depth above the bottom.
+        while (next > bottom + 1e-9 && b[2] < next - 1e-9 && a[2] > next - 1e-9) {
+            const t = (a[2] - next) / (a[2] - b[2]);
+            const q = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, next];
+            cur.push(q);
+            pieces.push(cur);
+            cur = [q];
+            next -= peck;
+        }
+        cur.push(b);
+    }
+    pieces.push(cur);
+    return pieces.map((p, k) => (k ? { kind: 'path', points: p, reenter: p[0][2] } : { kind: 'path', points: p }));
 }
 
 /**

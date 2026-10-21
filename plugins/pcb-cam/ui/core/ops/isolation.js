@@ -4,7 +4,7 @@
 
 import { widthAtDepth } from '../tools.js';
 import * as G from '../geometry.js';
-import { clipRings, cutsAtLevels, depthLevels, offsetRings, orderNearest, reversed } from './common.js';
+import { clipRings, cutsAtLevels, depthLevels, offsetRings, orderNearest, passDepth, reversed } from './common.js';
 
 /**
  * @param {object} ctx { op, tool, cutting, layer, mask, from, mirror }
@@ -16,7 +16,7 @@ export function isolation({ op, tool, cutting, layer, mask, from, mirror }) {
     // Seam: paths reach one tool width past the region edge so neighbouring
     // regions overlap instead of leaving slivers.
     const clip = mask ? G.offset(mask, width) : null;
-    const levels = depthLevels(op.depth, cutting.stepdown);
+    const levels = depthLevels(op.depth, passDepth(op, cutting, op.depth));
     const cuts = [];
     const allLoops = [];
     const allLines = [];

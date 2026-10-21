@@ -8,7 +8,7 @@
 import { storage, gcode, getWorkspaceState } from '@sienci/gsender-plugin-sdk';
 import {
     loadFile, createProject, applyCommand, validateProject, inspectBoard, componentOf, netOf, isPlated,
-    createToolDb, setTool, removeTool, findTool, widthAtDepth, regionMask, geometry as G,
+    createToolDb, setTool, removeTool, findTool, widthAtDepth, regionMask, multiDepth, drillMethod, geometry as G,
 } from '../core/index.js';
 import { DEFAULT_TOOLS, operationDefaults, standardJob, pickTool, OP_TOOL_TYPES } from './defaults.js';
 import { createEngine } from './engine.js';
@@ -1037,6 +1037,7 @@ async function runJob(job) {
         job.key = key;
         saveJobs();
         const secs = ((performance.now() - t0) / 1000).toFixed(1);
+        if (result.ok && result.files?.some((f) => f.name === state.loaded)) state.loaded = null; // regenerated: not what gSender has
         setStatus(result.ok ? `${job.name}: G-code ready in ${secs} s.` : `${job.name}: could not generate; see its problems.`, !result.ok);
     } catch (e) {
         console.error(e);
@@ -1055,13 +1056,45 @@ function removeJob(id) {
     saveJobs();
 }
 
+const toastEl = h('div', { className: 'toast', role: 'status' });
+let toastTimer = null;
+/** Short-lived notice over the plot area, for results that need to be seen. */
+function toast(text, kind = 'ok') {
+    clearTimeout(toastTimer);
+    toastEl.className = `toast show ${kind}`;
+    toastEl.textContent = text;
+    toastTimer = setTimeout(() => { toastEl.className = 'toast'; }, kind === 'err' ? 8000 : 5000);
+}
+
 async function loadIntoGsender(file) {
+    if (state.loading) return;
+    state.loading = file.name;
+    toast(`Loading ${file.name} into gSender…`, 'busy');
+    render();
     try {
         await gcode.loadToVisualizer(file.gcode, file.name);
+        state.loaded = file.name;
+        toast(`✓ ${file.name} loaded into gSender`);
         setStatus(`Loaded ${file.name} into gSender. Check the visualizer, zero X/Y/Z on the board, and air-cut first if unsure.`);
     } catch (e) {
+        toast(`Could not load into gSender: ${e.message}`, 'err');
         setStatus(`Could not load into gSender: ${e.message}`, true);
+    } finally {
+        state.loading = null;
+        render();
     }
+}
+
+/** "Load into gSender" button showing progress and the file last loaded. */
+function loadButton(file, { disabled = false, title = '' } = {}) {
+    const busy = state.loading === file.name;
+    const done = !busy && state.loaded === file.name;
+    return h('button', {
+        className: `b primary small${done ? ' done' : ''}`,
+        disabled: disabled || !!state.loading,
+        title: title || (done ? 'Loaded; click to load it again' : ''),
+        onClick: () => loadIntoGsender(file),
+    }, busy ? 'Loading…' : done ? '✓ Loaded' : 'Load into gSender');
 }
 
 function showCode(job, file) {
@@ -1566,14 +1599,20 @@ function opFields(op, set, { type, target }) {
             h('div', { className: 'note span2' }, `Cut width at this depth: ${fmt(w, 3)} mm${op.passes > 1 && w ? `; isolation gap ≈ ${fmt(w + (op.passes - 1) * w * (1 - op.overlap), 3)} mm` : ''}.`),
         ];
     } else if (type === 'drilling') {
+        const method = drillMethod(op, tool);
+        const bit = tool?.type === 'drill';
         specific = [
+            h('label', { className: 'f', title: 'Drill: plunge every hole straight down. Mill: spiral holes bigger than the tool to their size (end mills only)' }, 'Method',
+                h('select', { disabled: bit, onChange: (e) => set({ method: e.target.value }) },
+                    [['drill', 'Drill (plunge)'], ['mill', 'Mill (helix to size)']].map(([v, l]) => h('option', { value: v, selected: v === method }, l)))),
             sel('Holes', op.holes, [['all', 'All'], ['plated', 'Plated only'], ['nonplated', 'Non-plated only']], (v) => set({ holes: v })),
-            numF('Peck, mm', 'peck', { tip: '0 drills in one plunge' }),
             numF('Min Ø, mm', 'minDiameter', { placeholder: 'any' }),
             numF('Max Ø, mm', 'maxDiameter', { placeholder: 'any' }),
             numF('Breakthrough, mm', 'breakthrough', { tip: 'How far below the board bottom to go' }),
             faceSel,
-            h('div', { className: 'note span2' }, 'A drill plunges holes of its own size; an end mill helix-mills bigger holes and slots.'),
+            h('div', { className: 'note span2' }, method === 'drill'
+                ? `Every hole is plunged straight down with the ${bit ? 'drill' : 'end mill'}, so it comes out the tool's size.${bit ? '' : ' Slots are skipped.'}`
+                : "Holes the tool's size are plunged; bigger holes are milled to size with a spiral, and slots are milled."),
         ];
     } else if (type === 'cutout') {
         const tabs = op.tabs;
@@ -1630,9 +1669,10 @@ function selectedGeometry(op) {
     const tool = p.tools.find((t) => t.id === op.tool);
     const g = state.geo[op.id];
     const users = p.operations.filter((o) => o.tool === op.tool).length;
-    const cutF = (label, key, tip) => h('label', { className: 'f', title: tip ?? '' }, label,
+    const multi = multiDepth(op);
+    const cutF = (label, key, tip, disabled = false) => h('label', { className: 'f', title: tip ?? '' }, label,
         h('input', {
-            type: 'number', step: 'any', value: tool?.cutting[key] ?? '',
+            type: 'number', step: 'any', value: tool?.cutting[key] ?? '', disabled,
             onChange: (e) => { if (tool && e.target.value !== '') { command('tool.set', { tool: { ...tool, cutting: { ...tool.cutting, [key]: Number(e.target.value) } } }); render(); } },
         }));
     const issues = g ? [...(g.issues ?? []), ...(g.analysis ?? [])] : [];
@@ -1646,12 +1686,14 @@ function selectedGeometry(op) {
             h('div', { className: 'grid2' }, ...opFields(op, (patch) => updateOperation(op.id, patch), { type: op.type, target: { op: op.id } })),
             state.regionPicker?.target.op === op.id ? renderRegionPicker(state.regionPicker.target) : null,
         ]),
-        tool ? section('geo:cut', `Cutting: T${tool.toolNumber} ${tool.name}`, [
+        tool && op.type === 'drilling' ? drillingSections(op, tool, cutF, multi, users) : null,
+        tool && op.type !== 'drilling' ? section('geo:cut', `Cutting: T${tool.toolNumber} ${tool.name}`, [
             h('div', { className: 'grid2' },
                 cutF('Feed rate, mm/min', 'feed'),
                 cutF('Plunge rate, mm/min', 'plunge'),
                 cutF('Spindle speed, RPM', 'rpm', 'Written as S; a router with a manual dial ignores it, so set the dial to match'),
-                cutF('Depth per pass, mm', 'stepdown', 'Multi-depth: cuts deeper than this go in several passes')),
+                h('label', { className: 'chk' }, h('input', { type: 'checkbox', checked: multi, onChange: (e) => updateOperation(op.id, { multiDepth: e.target.checked }) }), 'Multi-depth'),
+                cutF('Depth per pass, mm', 'stepdown', 'With Multi-depth on, cuts deeper than this go in several passes', !multi)),
             h('div', { className: 'note' }, `Changes this project's copy of T${tool.toolNumber}${users > 1 ? `, used by ${users} geometries` : ''}. The Tool tab holds library defaults.`),
         ]) : null,
         h('div', { className: 'section' },
@@ -1659,6 +1701,9 @@ function selectedGeometry(op) {
             !state.layers[op.input] ? h('div', { className: 'note' }, `Open ${input?.file} to compute this geometry.`)
                 : s ? h('div', { className: 'kv' },
                     h('span', {}, 'Cuts'), h('span', {}, `${s.cuts}${s.holes !== undefined ? ` · ${s.holes} holes` : ''}${s.tabs !== undefined ? ` · ${s.tabs} tabs` : ''}`),
+                    s.breakdown ? h('span', { title: 'On the plot: + plunged, dashed circle milled to size, red slash skipped' }, 'Holes') : null,
+                    s.breakdown ? h('span', {}, [s.breakdown.plunged && `${s.breakdown.plunged} plunged`, s.breakdown.milled && `${s.breakdown.milled} milled`, s.breakdown.skipped && `${s.breakdown.skipped} skipped`].filter(Boolean).join(' · ') || 'none') : null,
+                    s.breakdown ? h('span', { className: 'note span2 legend' }, 'Plot: ', h('b', {}, '+'), ' plunged · ', h('b', {}, '◌'), ' milled to size (dashed) · ', h('b', { className: 'bad' }, '⊘'), ' skipped') : null,
                     h('span', {}, 'Cut length'), h('span', {}, `${fmt(s.cutLength / 1000, 2)} m`),
                     h('span', {}, 'Cutting time'), h('span', {}, `≈ ${fmt(s.minutes, 1)} min`),
                     h('span', {}, 'Deepest Z'), h('span', {}, `${s.minZ} mm`),
@@ -1668,6 +1713,32 @@ function selectedGeometry(op) {
         h('div', { className: 'row' },
             h('button', { className: 'b primary', disabled: !g?.ok, onClick: () => createJob([op.id]) }, 'Generate CNCJob'),
             h('button', { className: 'b danger small', onClick: () => { if (removeOperation(op.id)) { setStatus(`Deleted ${opName(op)}.`); render(); updateScene(); } } }, 'Delete')),
+    ];
+}
+
+/** Drilling geometry: plunge settings, and the helix settings when it mills. */
+function drillingSections(op, tool, cutF, multi, users) {
+    const mill = drillMethod(op, tool) === 'mill';
+    const peck = h('label', { className: 'f', title: 'Lift out of the hole to clear chips after each this much depth. 0 = no pecking' }, 'Peck, mm',
+        h('input', {
+            type: 'number', step: 'any', min: 0, value: op.peck ?? 0,
+            onChange: (e) => updateOperation(op.id, { peck: e.target.value === '' ? undefined : Number(e.target.value) }),
+        }));
+    return [
+        section('geo:drill', `Drilling: T${tool.toolNumber} ${tool.name}`, [
+            h('div', { className: 'grid2' },
+                cutF('Plunge rate, mm/min', 'plunge', 'Downward speed. Spirals are slowed so they never go down faster than this'),
+                peck,
+                cutF('Spindle speed, RPM', 'rpm', 'Written as S; a router with a manual dial ignores it, so set the dial to match')),
+        ]),
+        mill ? section('geo:mill', 'Milling (holes bigger than the tool, slots)', [
+            h('div', { className: 'grid2' },
+                cutF('Feed rate, mm/min', 'feed', 'Sideways speed around the spiral or along a slot'),
+                h('label', { className: 'chk' }, h('input', { type: 'checkbox', checked: multi, onChange: (e) => updateOperation(op.id, { multiDepth: e.target.checked }) }), 'Multi-depth'),
+                cutF('Depth per turn, mm', 'stepdown', 'With Multi-depth on, the spiral goes down about this much per turn (slots: per pass). Off: one turn to full depth', !multi)),
+            h('div', { className: 'note' }, 'Peck works best as a whole number of turns, e.g. two or three times the depth per turn.'),
+        ]) : null,
+        h('div', { className: 'note section' }, `Changes this project's copy of T${tool.toolNumber}${users > 1 ? `, used by ${users} geometries` : ''}. The Tool tab holds library defaults.`),
     ];
 }
 
@@ -1731,7 +1802,7 @@ function selectedJob(job) {
                     h('span', { className: 'name' }, f.name),
                     h('span', { className: 'muted' }, `${(f.gcode.length / 1024).toFixed(0)} KB · T${f.tools.join(', T')} · ≈ ${fmt(f.stats.minutes, 1)} min`)),
                 h('div', { className: 'row' },
-                    h('button', { className: 'b primary small', disabled: stale, title: stale ? 'Regenerate first' : '', onClick: () => loadIntoGsender(f) }, 'Load into gSender'),
+                    loadButton(f, { disabled: stale, title: stale ? 'Regenerate first' : '' }),
                     h('button', { className: 'b small', onClick: () => showCode(job, f) }, 'View code')))),
             r.files.length > 1 ? h('div', { className: 'note' }, 'Run the files in order. Change the bit and re-zero Z between them.') : null,
             h('div', { className: 'note' }, 'Before cutting: check the toolpaths in gSender\'s visualizer and do an air cut with Z0 set a few mm above the board.'),
@@ -1914,7 +1985,7 @@ function renderCode() {
             h('b', {}, c.file), h('span', { className: 'muted' }, ` · ${c.text.split('\n').length} lines`),
             h('span', { className: 'spacer' }),
             h('button', { className: 'b small', onClick: () => copyText(c.text, ta) }, 'Copy'),
-            file ? h('button', { className: 'b small primary', disabled: jobStale(job), onClick: () => loadIntoGsender(file) }, 'Load into gSender') : null),
+            file ? loadButton(file, { disabled: jobStale(job) }) : null),
         ta);
 }
 
@@ -2083,6 +2154,7 @@ document.addEventListener('dragleave', (e) => { if (!e.relatedTarget) plotPane.c
 document.addEventListener('drop', (e) => { e.preventDefault(); plotPane.classList.remove('drop'); openFiles(e.dataTransfer.files); });
 
 document.getElementById('root').append(header, side, main, statusBar);
+document.body.append(toastEl);
 await restore();
 // Geometry objects are always part of the job; older projects may have disabled ones.
 for (const op of state.project.operations.filter((o) => !o.enabled)) command('operation.set', { operation: { ...op, enabled: true } }, { quiet: true });
