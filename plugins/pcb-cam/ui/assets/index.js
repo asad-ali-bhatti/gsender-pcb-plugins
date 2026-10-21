@@ -12,6 +12,7 @@ import {
 } from '../core/index.js';
 import { DEFAULT_TOOLS, operationDefaults, standardJob, pickTool, OP_TOOL_TYPES } from './defaults.js';
 import { createEngine } from './engine.js';
+import { installIcons, icon } from './icons.js';
 import { createView, toolpathPath } from './view.js';
 import { session, savedHandle, fileApi, pickSaveFile, pickOpenFile, writePermission, writeFile, readFile } from './persist.js';
 
@@ -31,6 +32,8 @@ const SIDES = ['top', 'bottom', null];
 const COLORS = { 'copper-top': '#d4893f', 'copper-bottom': '#4a90e2', copper: '#c0a060', outline: '#e6c229', drill: '#f0f0f0', other: '#8b949e' };
 const OP_COLORS = ['#0ef6ae', '#ff7edb', '#5ab0ff', '#ffd166', '#c792ea', '#ff8a65', '#7ee787', '#f2cc60'];
 const OP_LABEL = { isolation: 'Isolation', drilling: 'Drilling', cutout: 'Cutout', clearing: 'Copper clearing' };
+const OP_ICON = { isolation: 'b-isolation', drilling: 'b-drill', cutout: 'b-cutout', clearing: 'b-clearing' };
+const TOOL_ICON = { vbit: 't-vbit', endmill: 't-endmill', drill: 't-drill' };
 const OP_SUFFIX = { isolation: 'iso', drilling: 'drill', cutout: 'cutout', clearing: 'ncc' };
 const TOOL_LABEL = { vbit: 'V-bit', endmill: 'End mill', drill: 'Drill' };
 
@@ -1423,7 +1426,9 @@ function objHeader(kind, name, color) {
     return h('div', { className: 'objhead' }, h('span', { className: 'swatch', style: `background:${color}` }), h('span', { className: 'kind' }, kind), h('span', { className: 'oname' }, name));
 }
 
-const sel = (label, value, options, onChange, tip) => h('label', { className: 'f', title: tip ?? '' }, label,
+/** Field label text with its icon; hovering the icon shows it large with `cap`. */
+const lab = (text, ic, cap) => (ic ? h('span', { className: 'lt' }, icon(ic, cap ?? ''), text) : text);
+const sel = (label, value, options, onChange, tip, ic) => h('label', { className: 'f', title: tip ?? '' }, lab(label, ic, tip),
     h('select', { onChange: (e) => onChange(e.target.value) }, options.map(([v, l]) => h('option', { value: v, selected: v === value }, l))));
 
 function fileInfo(input) {
@@ -1557,14 +1562,14 @@ function geometryForm(input, type, title, button, open) {
     return section(`form:${type}`, title, [
         h('div', { className: 'grid2' }, ...opFields(d, set, { type, target: { draft: key }, input })),
         state.regionPicker?.target.draft === key ? renderRegionPicker(state.regionPicker.target) : null,
-        h('div', { className: 'row' }, h('button', { className: 'b primary', onClick: () => createGeometry(input.id, type) }, button)),
+        h('div', { className: 'row' }, h('button', { className: 'b primary withic', onClick: () => createGeometry(input.id, type) }, icon(OP_ICON[type]), button)),
     ], { open });
 }
 
 /** Fields shared by geometry forms and geometry objects. */
 function opFields(op, set, { type, target }) {
     const p = state.project;
-    const numF = (label, key, opts = {}) => h('label', { className: 'f', title: opts.tip ?? '' }, label,
+    const numF = (label, key, opts = {}) => h('label', { className: 'f', title: opts.tip ?? '' }, lab(label, opts.icon, opts.tip),
         h('input', {
             type: 'number', step: opts.step ?? 'any', value: op[key] ?? '', placeholder: opts.placeholder ?? '',
             onChange: (e) => set({ [key]: e.target.value === '' ? undefined : opts.int ? parseInt(e.target.value, 10) : Number(e.target.value) }),
@@ -1591,10 +1596,10 @@ function opFields(op, set, { type, target }) {
     if (type === 'isolation') {
         const w = tool ? widthAtDepth(tool, op.depth) : null;
         specific = [
-            numF('Cut Z (depth), mm', 'depth', { tip: 'Below the copper surface. 0.08–0.12 cuts through 35 µm copper with margin for an uneven board' }),
-            numF('Passes', 'passes', { step: 1, int: true, tip: 'More passes = wider isolation gap' }),
-            numF('Overlap (0–0.9)', 'overlap', { tip: 'Fraction of the cut width each pass overlaps the previous one' }),
-            sel('Milling type', op.direction, [['climb', 'Climb'], ['conventional', 'Conventional']], (v) => set({ direction: v })),
+            numF('Cut Z (depth), mm', 'depth', { icon: 's-cutdepth', tip: 'Below the copper surface. 0.08–0.12 cuts through 35 µm copper with margin for an uneven board' }),
+            numF('Passes', 'passes', { step: 1, int: true, icon: 'b-passes', tip: 'More passes = wider isolation gap' }),
+            numF('Overlap (0–0.9)', 'overlap', { icon: 'c-isolation', tip: 'Fraction of the cut width each pass overlaps the previous one' }),
+            sel('Milling type', op.direction, [['climb', 'Climb'], ['conventional', 'Conventional']], (v) => set({ direction: v }), 'Climb keeps the copper on the cutter\'s right; cleaner edges on most machines', 'b-direction'),
             area, faceSel,
             h('div', { className: 'note span2' }, `Cut width at this depth: ${fmt(w, 3)} mm${op.passes > 1 && w ? `; isolation gap ≈ ${fmt(w + (op.passes - 1) * w * (1 - op.overlap), 3)} mm` : ''}.`),
         ];
@@ -1602,13 +1607,13 @@ function opFields(op, set, { type, target }) {
         const method = drillMethod(op, tool);
         const bit = tool?.type === 'drill';
         specific = [
-            h('label', { className: 'f', title: 'Drill: plunge every hole straight down. Mill: spiral holes bigger than the tool to their size (end mills only)' }, 'Method',
+            h('label', { className: 'f' }, lab('Method', method === 'drill' ? 'b-drill' : 'b-millhole', 'Drill: plunge every hole straight down. Mill: spiral holes bigger than the tool to their size (end mills only)'),
                 h('select', { disabled: bit, onChange: (e) => set({ method: e.target.value }) },
                     [['drill', 'Drill (plunge)'], ['mill', 'Mill (helix to size)']].map(([v, l]) => h('option', { value: v, selected: v === method }, l)))),
             sel('Holes', op.holes, [['all', 'All'], ['plated', 'Plated only'], ['nonplated', 'Non-plated only']], (v) => set({ holes: v })),
             numF('Min Ø, mm', 'minDiameter', { placeholder: 'any' }),
             numF('Max Ø, mm', 'maxDiameter', { placeholder: 'any' }),
-            numF('Breakthrough, mm', 'breakthrough', { tip: 'How far below the board bottom to go' }),
+            numF('Breakthrough, mm', 'breakthrough', { icon: 's-breakthrough', tip: 'How far below the board bottom to go' }),
             faceSel,
             h('div', { className: 'note span2' }, method === 'drill'
                 ? `Every hole is plunged straight down with the ${bit ? 'drill' : 'end mill'}, so it comes out the tool's size.${bit ? '' : ' Slots are skipped.'}`
@@ -1616,20 +1621,20 @@ function opFields(op, set, { type, target }) {
         ];
     } else if (type === 'cutout') {
         const tabs = op.tabs;
-        const tabF = (label, key, int) => h('label', { className: 'f' }, label, h('input', {
+        const tabF = (label, key, int, cap, ic = 'c-tabs') => h('label', { className: 'f' }, lab(label, ic, cap), h('input', {
             type: 'number', step: int ? 1 : 'any', value: tabs[key],
             onChange: (e) => set({ tabs: { ...tabs, [key]: int ? parseInt(e.target.value, 10) : Number(e.target.value) } }),
         }));
         specific = [
-            sel('Side', op.side, [['outside', 'Outside the outline'], ['inside', 'Inside'], ['on', 'On the line']], (v) => set({ side: v })),
-            numF('Breakthrough, mm', 'breakthrough'),
-            tabF('Tabs (gaps)', 'count', true), tabF('Tab width, mm', 'width'), tabF('Tab height, mm', 'height'),
+            sel('Side', op.side, [['outside', 'Outside the outline'], ['inside', 'Inside'], ['on', 'On the line']], (v) => set({ side: v }), 'Which side of the outline the cutter runs on', 'b-cutout'),
+            numF('Breakthrough, mm', 'breakthrough', { icon: 's-breakthrough', tip: 'How far below the board bottom to go' }),
+            tabF('Tabs (gaps)', 'count', true, 'Bridges left so the board stays held; 0 cuts it free'), tabF('Tab width, mm', 'width', false, 'Length of each bridge along the edge'), tabF('Tab height, mm', 'height', false, 'Height of each bridge up from the board bottom', 's-tabheight'),
             faceSel,
         ];
     } else {
         specific = [
-            numF('Cut Z (depth), mm', 'depth'),
-            numF('Overlap (0–0.9)', 'overlap'),
+            numF('Cut Z (depth), mm', 'depth', { icon: 's-cutdepth', tip: 'Below the copper surface' }),
+            numF('Overlap (0–0.9)', 'overlap', { icon: 'c-clearing', tip: 'Fraction of the cut width each pass overlaps the previous one' }),
             area, faceSel,
             h('label', { className: 'chk span2' }, h('input', { type: 'checkbox', checked: op.rest, onChange: (e) => set({ rest: e.target.checked }) }), 'Rest machining: only where earlier geometries did not cut'),
         ];
@@ -1670,7 +1675,7 @@ function selectedGeometry(op) {
     const g = state.geo[op.id];
     const users = p.operations.filter((o) => o.tool === op.tool).length;
     const multi = multiDepth(op);
-    const cutF = (label, key, tip, disabled = false) => h('label', { className: 'f', title: tip ?? '' }, label,
+    const cutF = (label, key, tip, disabled = false, ic) => h('label', { className: 'f', title: tip ?? '' }, lab(label, ic, tip),
         h('input', {
             type: 'number', step: 'any', value: tool?.cutting[key] ?? '', disabled,
             onChange: (e) => { if (tool && e.target.value !== '') { command('tool.set', { tool: { ...tool, cutting: { ...tool.cutting, [key]: Number(e.target.value) } } }); render(); } },
@@ -1693,7 +1698,7 @@ function selectedGeometry(op) {
                 cutF('Plunge rate, mm/min', 'plunge'),
                 cutF('Spindle speed, RPM', 'rpm', 'Written as S; a router with a manual dial ignores it, so set the dial to match'),
                 h('label', { className: 'chk' }, h('input', { type: 'checkbox', checked: multi, onChange: (e) => updateOperation(op.id, { multiDepth: e.target.checked }) }), 'Multi-depth'),
-                cutF('Depth per pass, mm', 'stepdown', 'With Multi-depth on, cuts deeper than this go in several passes', !multi)),
+                cutF('Depth per pass, mm', 'stepdown', 'With Multi-depth on, cuts deeper than this go in several passes', !multi, 's-stepdown')),
             h('div', { className: 'note' }, `Changes this project's copy of T${tool.toolNumber}${users > 1 ? `, used by ${users} geometries` : ''}. The Tool tab holds library defaults.`),
         ]) : null,
         h('div', { className: 'section' },
@@ -1719,7 +1724,7 @@ function selectedGeometry(op) {
 /** Drilling geometry: plunge settings, and the helix settings when it mills. */
 function drillingSections(op, tool, cutF, multi, users) {
     const mill = drillMethod(op, tool) === 'mill';
-    const peck = h('label', { className: 'f', title: 'Lift out of the hole to clear chips after each this much depth. 0 = no pecking' }, 'Peck, mm',
+    const peck = h('label', { className: 'f' }, lab('Peck, mm', 's-peck', 'Lift out of the hole to clear chips after each this much depth. 0 = no pecking'),
         h('input', {
             type: 'number', step: 'any', min: 0, value: op.peck ?? 0,
             onChange: (e) => updateOperation(op.id, { peck: e.target.value === '' ? undefined : Number(e.target.value) }),
@@ -1735,7 +1740,7 @@ function drillingSections(op, tool, cutF, multi, users) {
             h('div', { className: 'grid2' },
                 cutF('Feed rate, mm/min', 'feed', 'Sideways speed around the spiral or along a slot'),
                 h('label', { className: 'chk' }, h('input', { type: 'checkbox', checked: multi, onChange: (e) => updateOperation(op.id, { multiDepth: e.target.checked }) }), 'Multi-depth'),
-                cutF('Depth per turn, mm', 'stepdown', 'With Multi-depth on, the spiral goes down about this much per turn (slots: per pass). Off: one turn to full depth', !multi)),
+                cutF('Depth per turn, mm', 'stepdown', 'With Multi-depth on, the spiral goes down about this much per turn (slots: per pass). Off: one turn to full depth', !multi, 's-stepdown')),
             h('div', { className: 'note' }, 'Peck works best as a whole number of turns, e.g. two or three times the depth per turn.'),
         ]) : null,
         h('div', { className: 'note section' }, `Changes this project's copy of T${tool.toolNumber}${users > 1 ? `, used by ${users} geometries` : ''}. The Tool tab holds library defaults.`),
@@ -1859,6 +1864,7 @@ function tabTools() {
                 ? renderToolForm(t, false)
                 : h('div', { className: 'item' },
                     h('div', { className: 'top' },
+                        TOOL_ICON[t.type] ? icon(TOOL_ICON[t.type], 'Tool and the profile it cuts') : null,
                         h('span', { className: 'name' }, t.name),
                         used.has(t.id) ? h('span', { className: 'badge' }, 'in project') : null,
                         h('button', { className: 'link', onClick: () => { state.editTool = t.id; state.toolErrors = null; renderSide(); } }, 'edit'),
@@ -1947,7 +1953,7 @@ function renderMain() {
 function renderPrefs() {
     const p = state.project;
     const s = p.setup;
-    const num = (label, key, tip) => h('label', { className: 'f', title: tip ?? '' }, label,
+    const num = (label, key, tip, ic) => h('label', { className: 'f', title: tip ?? '' }, lab(label, ic, tip),
         h('input', { type: 'number', step: 'any', value: s[key], onChange: (e) => { command('setup.update', { [key]: Number(e.target.value) }); renderPrefs(); } }));
     prefsPane.replaceChildren(h('div', { className: 'prefs' },
         h('h3', {}, 'Project preferences'),
@@ -1955,8 +1961,8 @@ function renderPrefs() {
             h('h4', {}, 'Stock and heights'),
             h('div', { className: 'grid2' },
                 num('Board thickness, mm', 'stockThickness', 'Used for drilling and cutout depth'),
-                num('Safe Z, mm', 'safeZ', 'Height for rapids between geometries and tool changes'),
-                num('Travel Z, mm', 'travelZ', 'Height for short moves inside a geometry'),
+                num('Safe Z, mm', 'safeZ', 'Height for rapids between geometries and tool changes', 's-height'),
+                num('Travel Z, mm', 'travelZ', 'Height for short moves inside a geometry', 's-height'),
                 h('label', { className: 'f' }, 'Origin (X0 Y0)',
                     h('select', { onChange: (e) => { command('setup.update', { origin: e.target.value }); refresh(); } },
                         [['board-lower-left', 'Board lower-left corner'], ['gerber', 'Gerber file origin']].map(([v, l]) => h('option', { value: v, selected: s.origin === v }, l))))),
@@ -2155,6 +2161,7 @@ document.addEventListener('drop', (e) => { e.preventDefault(); plotPane.classLis
 
 document.getElementById('root').append(header, side, main, statusBar);
 document.body.append(toastEl);
+installIcons();
 await restore();
 // Geometry objects are always part of the job; older projects may have disabled ones.
 for (const op of state.project.operations.filter((o) => !o.enabled)) command('operation.set', { operation: { ...op, enabled: true } }, { quiet: true });

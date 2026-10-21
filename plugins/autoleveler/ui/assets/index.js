@@ -1,4 +1,5 @@
 import { machine, viewer, gcode, storage, getReduxState } from '@sienci/gsender-plugin-sdk';
+import { installIcons, icon } from './icons.js';
 import {
     gridPoints, createHeightMap, validateGrid, isComplete, mapStats, heightAt, parsePRB, levelGcode, fmt,
 } from './leveling.js';
@@ -489,10 +490,11 @@ function importMap(text) {
 
 /** Small "?" marker that shows `tip` on hover. */
 const tipMark = (tip) => (tip ? h('span', { className: 'q', 'data-tip': tip, onClick: (e) => e.preventDefault() }, '?') : null);
-const tipLabel = (text, tip) => h('span', {}, text, tipMark(tip));
+/** Label text with help: an icon that shows large with the tip on hover, or a "?" mark. */
+const tipLabel = (text, tip, ic) => (ic ? h('span', { className: 'lt' }, icon(ic, tip ?? ''), text) : h('span', {}, text, tipMark(tip)));
 
-function num(key, label, { step = 'any', min, int = false, tip, after } = {}) {
-    return h('label', { className: 'f' }, tipLabel(label, tip),
+function num(key, label, { step = 'any', min, int = false, tip, after, icon: ic } = {}) {
+    return h('label', { className: 'f' }, tipLabel(label, tip, ic),
         h('input', {
             type: 'number', step, min, value: state.s[key], disabled: state.scanning,
             onChange: (e) => {
@@ -645,20 +647,21 @@ function tabSetup() {
             h('div', { className: 'row' },
                 h('button', { className: 'b', disabled: state.scanning, onClick: useFileBounds }, 'Use loaded file bounds'),
                 tipMark('Set the probe area to the loaded G-code outline, expanded by Margin on every side.'),
-                h('div', { style: 'width:70px' }, num('margin', 'Margin', {
+                h('div', { style: 'width:104px' }, num('margin', 'Margin', {
                     after: onMarginChange,
+                    icon: 'b-margin',
                     tip: 'Extra mm added around the job when using file bounds. Changing it updates the area while it still matches the file bounds. 0 or negative keeps probes on the board when the job runs to its edge.',
                 }))),
             h('div', { className: 'note', id: 'derived' })),
         h('div', { className: 'section' },
             h('h4', {}, 'Probing'),
             h('div', { className: 'grid2' },
-                num('clearance', 'Travel height', { tip: 'How far (mm) above the first point\'s surface the bit travels between points (0.5–10). Must clear clamps.' }),
-                num('maxBelow', 'Max depth below first point', { tip: 'How far (mm) below the first point\'s surface any later probe may go before the scan stops (0.1–3). A board is never off by more than this.' }),
+                num('clearance', 'Travel height', { icon: 's-probeheight', tip: 'How far (mm) above the first point\'s surface the bit travels between points (0.5–10). Must clear clamps.' }),
+                num('maxBelow', 'Max depth below first point', { icon: 's-maxbelow', tip: 'How far (mm) below the first point\'s surface any later probe may go before the scan stops (0.1–3). A board is never off by more than this.' }),
                 num('firstTravel', 'First probe max travel', { tip: 'The first probe searches down at most this far (mm) from where the bit starts (1–25). Start with the bit a few mm above the board.' }),
                 num('feed', 'Probe feed', { min: 1, tip: 'Feed (mm/min) of the first, fast probe move.' }),
                 num('slowFeed', 'Slow re-probe feed (0 = off)', { min: 0, tip: 'After contact, back off and probe again at this slower feed (mm/min) for a more accurate reading. 0 skips it.' }),
-                num('backoff', 'Re-probe back-off', { tip: 'How far (mm) to lift after the first contact before the slow re-probe.' })),
+                num('backoff', 'Re-probe back-off', { icon: 's-backoff', tip: 'How far (mm) to lift after the first contact before the slow re-probe.' })),
             chk('zeroFirst', 'Set work Z0 at first point', null, 'Set work Z0 where the first point touches, so all heights are relative to it.'),
             chk('probeTest', 'Touch-test the probe before scanning', null, 'Before anything moves, wait until you touch the probe lead to the bit, so a broken probe circuit is caught first.'),
             h('div', { className: 'note' }, 'Jog the bit a few mm above the board and attach the probe clip. The scan finds the surface itself at the first point; the current Z0 is not used for any move.')),
@@ -680,7 +683,7 @@ function tabProbe() {
         h('div', { className: 'row' },
             state.scanning
                 ? h('button', { className: 'b danger', onClick: stopScan }, '■ Stop')
-                : h('button', { className: 'b primary', onClick: () => startScan() }, state.map ? '▶ New scan' : '▶ Start scan'),
+                : h('button', { className: 'b primary withic', onClick: () => startScan() }, icon('b-probe'), state.map ? 'New scan' : 'Start scan'),
             !state.scanning && canResume ? h('button', { className: 'b', onClick: () => startScan({ resume: true }) }, 'Resume') : null),
         stale ? h('div', { className: 'note' }, 'Setup grid differs from the stored map. A new scan will use the Setup grid.') : null,
         h('div', { className: 'progress' }, h('div', { id: 'bar', style: 'width:0%' })),
@@ -722,7 +725,7 @@ function tabApply() {
                     h('option', { value: 'absolute', selected: state.s.reference === 'absolute' }, 'Absolute work Z')))),
             h('div', { className: 'note' }, 'First point: heights are relative to the first probe point, so you can change bits and re-zero Z there. Absolute: keep the Z0 used during the scan.'),
             h('div', { className: 'row' },
-                h('button', { className: 'b primary', disabled: !isComplete(map) || state.scanning, onClick: applyLevel }, 'Apply & load levelled G-code'))),
+                h('button', { className: 'b primary withic', disabled: !isComplete(map) || state.scanning, onClick: applyLevel }, icon('b-level'), 'Apply & load levelled G-code'))),
         h('div', { className: 'section' },
             h('h4', {}, 'Height map file'),
             h('textarea', { id: 'io', placeholder: 'Paste height map JSON here to import' }),
@@ -850,6 +853,7 @@ async function init() {
     if (state.map) state.tab = isComplete(state.map) ? 'apply' : 'probe';
     render();
     setupTips();
+    installIcons();
     if (state.tab === 'apply') refreshFile();
     clipOverlayAroundPanel();
     excludeOverlayFromRecording();
