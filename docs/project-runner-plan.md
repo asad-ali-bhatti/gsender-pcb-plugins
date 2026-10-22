@@ -56,7 +56,7 @@ setup → [home] → set XY origin → bit change(V-bit) → zero Z → probe ma
 ```
 
 - A **bit change** is inserted automatically wherever consecutive jobs use different tools, and the user can add one anywhere (for example, a fresh V-bit halfway through).
-- Each step has a status (`pending | active | done | skipped | failed | cancelled`) and timestamps. Run steps also record `lastAckedLine`, the number of lines, and the levelled-file hash.
+- Each step has a status (`pending | active | done | skipped | failed | cancelled`) and timestamps. Run steps also record the last acknowledged line, the planner blocks still queued (from `Bf:`), the number of lines, and the levelled-file hash.
 - Prompts name the physical action and the bit: "Insert **Drill 0.8 mm**. Clip the probe to it, then click **Zero Z**."
 
 ### Bit change and Z zeroing (zero-at-origin workflow)
@@ -75,10 +75,14 @@ setup → [home] → set XY origin → bit change(V-bit) → zero Z → probe ma
 - If a job runs past the map, it shows Autoleveler's coverage warnings, and Start is blocked when the job goes more than 1 mm outside the map.
 
 ### Running a job
-- Load the levelled (or plain) G-code with `loadToVisualizer`, check that `sender:status.total` matches the line count, then **the user clicks Start**, which sends `gcode:start`.
-- Track progress from `sender:status` and `workflow:state`. A job is done when `finishTime > 0` and every line has been received.
-  - gSender's own finish rule still applies: every line acked and the machine Idle for 500 ms.
-- Persist `lastAckedLine` throttled to every 5 s, and also on pause, error and close events.
+- Load the levelled (or plain) G-code with `loadToVisualizer`, check that `sender:status.total` matches the line count, then **the user clicks Start**, which sends `gcode:start`. gSender's own Start/Pause/Stop buttons stay in sync with commands sent from the plugin (Phase 0).
+- **A job is done when `workflow:state` goes from `running` to `idle` and the controller reports Idle** (gSender then shows "Job End Status: COMPLETE").
+  - Not `finishTime > 0`: that is set when the last line is *acknowledged*, which happens when it enters the controller's 100-block planner. In the Phase 0 run that was about 20 s before the job actually ended.
+- **Lines reached:** `received` in `sender:status` runs ahead of execution by up to the planner depth (100 blocks on the user's board).
+  - The line actually executing ≈ `received` − blocks still queued, where queued = planner size − the `Bf:` free count in the status report.
+  - Arcs (G2/G3) are split into many planner blocks, so this is approximate. The Runner always steps back to the start of the path (see Recovery).
+- `sender:status` is only meaningful for a run started from line 1. After `gcode:start <line>`, gSender reported received = total from the first second. During a resumed run, the Runner tracks progress from controller state and the job's end instead.
+- Persist the progress fields throttled to every 5 s, and also on pause, error and close events.
 
 ### Trusted coordinates
 - **When the snapshot is taken:** on Set origin and on every Zero Z. The snapshot holds the WCO (from the status reports; `$#` is unreliable on the user's link), MPos and whether the machine was homed.
@@ -96,8 +100,20 @@ setup → [home] → set XY origin → bit change(V-bit) → zero Z → probe ma
 ### Recovery
 - **Connection lost, machine still powered** (the most common case: bridge, USB or EMI):
   - The bridge feed-holds on client loss, and grblHAL keeps its position if it wasn't reset mid-move.
-  - On reconnect, read the status: if the WCO matches the snapshot and no alarm or reset happened, coordinates stay trusted.
-  - Offer **Resume from line N** (`lastAckedLine` minus a small backoff, rounded back to the start of the current path so the cut doesn't start mid-segment). This runs `gcode:start N` on the *same* levelled file, and the hash check proves the line numbers still match.
+  - **What gSender does (Phase 0):**
+    - It shows a "Port Disconnected" dialog whose Resume button only reconnects. Its "suggested line" was wrong: it said line 10 while the machine was holding at about line 34, with lines up to 130 already queued in the planner.
+    - On reconnect it does **not** reset the controller. The machine stays in Hold with its planner blocks and position intact.
+    - gSender then clears its job progress and **enables Start**, which would rerun the job from line 1 on top of the held blocks.
+  - **So the Runner takes over after a reconnect:**
+    - It blocks Start and Cycle Start.
+    - It reads the status: Hold, queued blocks (`Bf:`), WCO.
+    - It computes the line reached: last `received` before the drop minus the blocks still queued.
+    - It soft-resets while holding. That's safe: no alarm, position kept, planner cleared.
+    - If the WCO matches the snapshot, coordinates stay trusted.
+  - **Resume from line N:**
+    - N is the start of the path containing the line reached, so the cut never starts mid-segment.
+    - The Runner runs `gcode:start N, zMax, safeHeight` on the *same* levelled file. Its hash proves the line numbers still match.
+    - **Choose N where the tool is above the surface.** gSender's resume preamble raises to `zMax + safeHeight`, restores the spindle (`M3 S…`), rapids to the line's XY, then **rapids (`G0`) down to the line's Z**. Starting mid-cut would plunge a fragile V-bit into the copper at rapid speed. So N is the line that plunges into the path, which leaves the descent to the job's own feed-rate plunge.
 - **Power loss, or a reset with lost position:**
   - **Homing enabled (`$22`):** home, restore the saved G54 (grblHAL keeps it in non-volatile storage, and the Runner checks it against the snapshot), re-zero Z at X0 Y0 because the bit may have shifted, then restart **from the start of the interrupted pass**. Re-cutting part of an isolation pass at the same depth does no harm.
   - **No homing:** a guided re-reference. Jog to X0 Y0 using the origin mark or the board corner (there's a zoomed reference picture of the origin on the board), confirm, set XY, zero Z, then restart from the start of the interrupted pass. The Runner says plainly that alignment is only as good as the visual check.
@@ -121,22 +137,39 @@ setup → [home] → set XY origin → bit change(V-bit) → zero Z → probe ma
   - `runstate.js` (file schema, migrations)
 
 ### Changes to PCB CAM
+- Move the job → G-code recipe into the core as one pure function, `generateJob(doc, jobId) → { ok, issues, files }`. Today it's spread over the UI (`runnable()`, `runJob()`, and the job name used as the project name), and the Runner must not keep a second copy of that logic.
 - Write `gcodeHash` (and the core version) per job into the project file when a job is generated.
+- Report jobs whose board files are missing from the project file. `Board.pcbcam.json` has a drilling operation but no drill file.
 - Optionally, add a "Run in Project Runner" hint after Save.
 
 ## Phases
-0. **Spikes:**
-   - Load and start a job from an overlay plugin. Do gSender's Start/Pause buttons stay in sync? Does start-from-line work through `machine.command`?
-   - Does `sender:status` keep arriving while the user is on another page?
-   - Does gSender's own disconnect "Resume" dialog compete with the Runner, and which one should handle it?
-   - What does the user's machine report for `$22`/`$23`?
-   - Does regenerating from a project file reproduce PCB CAM's G-code byte for byte?
+0. **Spikes:** done 2026-10-22 (except the real machine's `$22`/`$23`); see Phase 0 findings below.
 1. **Open project and run jobs:** open the file, pick jobs, steps, run through gSender, statuses, history, run file.
 2. **Bit change and Zero Z:** automatic bit-change insertion, manual insertion, a guided probe at X0 Y0.
 3. **Built-in levelling:** reference job (largest area, or chosen), automatic grid, one map per project, levelling each job exactly once, coverage gate.
 4. **Coordinate trust and resume after a lost connection.**
 5. **Power-loss recovery:** homing path and visual re-reference path, plus homing setup guidance.
 6. **Release:** README, packaging, a real-app memory check (a heap that stays flat for a full job with usage data collection on).
+
+## Phase 0 findings (2026-10-22, gSender 1.7.0-Edge-2)
+How the spikes were run:
+- gSender was connected over its network option to `scripts/grblhal-sim.mjs` on 127.0.0.1:2323. It's a grblHAL simulator with a 100-block planner, probing, work offsets, and fault injection over HTTP: disconnect, disconnect with feed hold, reset, power cycle, limit trip.
+- The plugin side ran inside the Autoleveler overlay iframe (same SDK and permissions a Runner needs), driven from outside over CDP.
+- The user's machine was offline (dead controller board), so nothing touched real hardware.
+
+| Question | Result | Consequence |
+|---|---|---|
+| Load and start from an overlay plugin | `gcode.loadToVisualizer` enables gSender's Start. `machine.command('gcode:start')`, `'gcode:pause'` and `'gcode:resume'` work, and gSender's Start/Pause/Stop buttons and status header follow. | The Runner drives jobs through gSender's sender. No own streaming. |
+| Start from line | `machine.command('gcode:start', 200, zMax, safeHeight)` resumed at line 200 (`job:start` reports `true`). The preamble rapids down to the line's Z (`G0`). During a resumed run, `sender:status` showed received = total at once. | Resume at a path's plunge line. Track resumed runs from controller state and job end, not `sender:status`. |
+| Events while on another page | The overlay iframe stays mounted (same window object, hidden) on other pages, and controller events keep arriving. | A `visualizer-overlay` contribution is the right shape. |
+| Job end | `finishTime` is set when the last line is acknowledged, about 20 s before the job ended. The end is `workflow:state` `idle` plus controller Idle. | Use the workflow and controller state for "done". |
+| Lines reached | Grbl acknowledges a line when it enters the planner, so `received` leads execution by up to 100 blocks. | Line reached = received − queued blocks (`Bf:`), then back to the path start. |
+| gSender's disconnect dialog | "Port Disconnected" with Resume (reconnect only). Suggested line 10 when the machine was at about line 34. | The Runner computes its own resume line and tells the user to ignore gSender's. |
+| Reconnect behaviour | No soft reset on connect (`$I`, `$$`, `$E…`, `$#`, then `$G` every 0.5 s). The machine stayed in Hold with 100 blocks queued. gSender reset its progress and enabled Start. | The Runner blocks Start, soft-resets while holding, then resumes from its own line. |
+| Controller events | `controller:state` carries the status; WCO arrives only every few reports and can be stale right after `G10`. | Take coordinate snapshots from a fresh report (or `$#` where it works). |
+| Regenerating G-code | All 10 jobs in the user's two project files give identical SHA-256 in Node and in gSender's Electron engine, and across runs. | Regenerate in the Runner and check `gcodeHash`. |
+| Missing inputs | `Board.pcbcam.json` has a drilling op without its drill file (job fails with `no-operations`). | The Runner lists such jobs as not runnable, with the reason. |
+| `$22` / `$23` on the user's machine | Not read: the controller board died (24 V rail shorted). | Read once the replacement board is in. The recovery design covers both homing and non-homing. |
 
 ## Verification
 - **Unit tests:**
@@ -146,7 +179,8 @@ setup → [home] → set XY origin → bit change(V-bit) → zero Z → probe ma
   - hash check
   - run file round-trip
   - vendored copies identical to their sources
-- **Mock host (`npm run dev`):** a full run with a simulated disconnect and a simulated reset, using the simulated Grbl.
+- **Real gSender against `scripts/grblhal-sim.mjs`:** a full run with injected disconnect (with and without feed hold), soft reset, limit trip and power cycle.
+- **Mock host (`npm run dev`):** UI work without gSender.
 - **Real machine:**
   - a dry run with Z raised: every step, a deliberate bridge disconnect, then resume
   - then a real board: isolation, drill and cutout with three bit changes

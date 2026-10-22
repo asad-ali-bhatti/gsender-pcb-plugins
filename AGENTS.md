@@ -38,4 +38,5 @@ Rules that follow from it:
 
 ## Working in the repo
 - `npm test`: unit and golden tests. `npm run dev`: mock gSender host at http://localhost:8765 (simulated Grbl).
+- `node scripts/grblhal-sim.mjs --trace`: a grblHAL simulator on 127.0.0.1:2323 that real gSender connects to (network connection, IP 127.0.0.1, port 2323), with fault injection on http://127.0.0.1:2324/ (`/disconnect?hold=1`, `/reset`, `/powercycle`, `/limit`). Use it, not the user's machine, to test anything that runs jobs. Point gSender's saved connection back to the machine afterwards.
 - Installed plugins are copies in gSender's plugin folder. Re-run `npm run install-plugins` after editing, or you'll test stale code. A new plugin or a manifest change needs a gSender restart.
