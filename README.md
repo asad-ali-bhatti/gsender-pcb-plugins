@@ -6,6 +6,8 @@
 
 Plugins for [gSender](https://github.com/Sienci-Labs/gsender) that turn a hobby CNC into a PCB mill: probe and level the board, then (planned) generate isolation, drilling and cutout toolpaths without leaving gSender. Two independent plugins: **Autoleveler** for probing and levelling, and **PCB CAM** (planned), one place for the whole fabrication process from Gerber files to G-code, bringing the PCB features of [FlatCAM](http://flatcam.org/) into gSender.
 
+**Goal:** someone new to the hobby imports their board files, clicks through the prompts, and mills a working board. Every default is chosen for tools and materials that are easy to buy: 3018/3020-class machines, single-sided FR4/FR1 copper-clad, and V-bits, drills and end mills from common kits. The plugins are built to prevent mistakes rather than document them.
+
 > Requires gSender **1.6+** with plugin support (tested against 1.7.0 Edge). Grbl and grblHAL controllers.
 
 ## Plugins
@@ -70,6 +72,10 @@ A single full-featured plugin that turns Gerber and Excellon files into G-code. 
 | Double-sided alignment | Double-Sided tool: mirror axis and alignment-hole drilling |
 | Tool database | Tools DB: shared bit library (V-bits with measured tip and angle) used by every tool |
 | Paste / solder-mask stencils | Solder Paste tool |
+
+## Roadmap: Project Runner plugin
+
+Runs a whole PCB CAM project on the machine: open the project file, pick the jobs, and follow the prompts. It inserts a bit change wherever the bit changes and walks you through zeroing Z after each one. It probes one height map per project and levels each job that needs it, exactly once. It tracks every job (done, cancelled, failed) and resumes after a lost connection or a power cut, with guidance when the machine coordinates can't be trusted. Plan: [docs/project-runner-plan.md](docs/project-runner-plan.md).
 
 ## License
 
