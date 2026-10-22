@@ -78,8 +78,10 @@ setup → [home] → set XY origin → bit change(V-bit) → zero Z → probe ma
 - Load the levelled (or plain) G-code with `loadToVisualizer`, check that `sender:status.total` matches the line count, then **the user clicks Start**, which sends `gcode:start`. gSender's own Start/Pause/Stop buttons stay in sync with commands sent from the plugin (Phase 0).
 - **A job is done when `workflow:state` goes from `running` to `idle` and the controller reports Idle** (gSender then shows "Job End Status: COMPLETE").
   - Not `finishTime > 0`: that is set when the last line is *acknowledged*, which happens when it enters the controller's 100-block planner. In the Phase 0 run that was about 20 s before the job actually ended.
-- **Lines reached:** `received` in `sender:status` runs ahead of execution by up to the planner depth (100 blocks on the user's board).
+- **Lines reached:** `received` in `sender:status` runs ahead of execution by up to the planner depth.
+  - The planner depth varies by board, so read it from `$I` `[OPT:…,<blocks>,<rx bytes>]`. The user's replacement board has 35 blocks; the simulator and the old board had 100.
   - The line actually executing ≈ `received` − blocks still queued, where queued = planner size − the `Bf:` free count in the status report.
+  - `Bf:` is only reported when `$10` includes the buffer bit (`$10=3` with machine positions). The user's board has `$10=1`. The Runner asks the user to confirm the change once, and otherwise falls back to "back to the start of the current pass".
   - Arcs (G2/G3) are split into many planner blocks, so this is approximate. The Runner always steps back to the start of the path (see Recovery).
 - `sender:status` is only meaningful for a run started from line 1. After `gcode:start <line>`, gSender reported received = total from the first second. During a resumed run, the Runner tracks progress from controller state and the job's end instead.
 - Persist the progress fields throttled to every 5 s, and also on pause, error and close events.
@@ -143,7 +145,7 @@ setup → [home] → set XY origin → bit change(V-bit) → zero Z → probe ma
 - Optionally, add a "Run in Project Runner" hint after Save.
 
 ## Phases
-0. **Spikes:** done 2026-10-22 (except the real machine's `$22`/`$23`); see Phase 0 findings below.
+0. **Spikes:** done 2026-10-22; see Phase 0 findings below.
 1. **Open project and run jobs:** open the file, pick jobs, steps, run through gSender, statuses, history, run file.
 2. **Bit change and Zero Z:** automatic bit-change insertion, manual insertion, a guided probe at X0 Y0.
 3. **Built-in levelling:** reference job (largest area, or chosen), automatic grid, one map per project, levelling each job exactly once, coverage gate.
@@ -169,7 +171,7 @@ How the spikes were run:
 | Controller events | `controller:state` carries the status; WCO arrives only every few reports and can be stale right after `G10`. | Take coordinate snapshots from a fresh report (or `$#` where it works). |
 | Regenerating G-code | All 10 jobs in the user's two project files give identical SHA-256 in Node and in gSender's Electron engine, and across runs. | Regenerate in the Runner and check `gcodeHash`. |
 | Missing inputs | `Board.pcbcam.json` has a drilling op without its drill file (job fails with `no-operations`). | The Runner lists such jobs as not runnable, with the reason. |
-| `$22` / `$23` on the user's machine | Not read: the controller board died (24 V rail shorted). | Read once the replacement board is in. The recovery design covers both homing and non-homing. |
+| The user's machine (replacement board, read 2026-10-22) | Plain **Grbl 1.1f** ("Monport" build), not grblHAL. `[OPT:VMZHL,35,254]`: 35 planner blocks, 254-byte receive buffer. **Homing on** (`$22=1`, `$23=3`: X and Y home toward minus, Z up), hard limits on (`$21=1`), soft limits off. `$130–132` are 500/500/200 (not the 3020's travel). `$10=1` (no `Bf:`). The board starts **Idle and unlocked** after a reset despite the `L` (lock until homed) option. | Power-loss recovery can home, then restore G54. A controller restart must still mark coordinates untrusted, because the board doesn't lock itself. The planner and receive-buffer sizes come from `$I`, never hard-coded. |
 
 ## Verification
 - **Unit tests:**
