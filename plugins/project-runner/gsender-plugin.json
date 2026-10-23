@@ -1,0 +1,37 @@
+{
+  "id": "com.asadalibhatti.project-runner",
+  "name": "Project Runner",
+  "description": "Runs a PCB CAM project on the machine: pick its jobs, run them one after another through gSender, and keep track of every job in a run file.",
+  "version": "0.0.1",
+  "engine": ">=1.6.0",
+  "ui": {
+    "entry": "ui/index.html",
+    "contributions": [
+      {
+        "slot": "visualizer-overlay",
+        "label": "Run",
+        "icon": "▶"
+      }
+    ]
+  },
+  "permissions": ["machine:read", "machine:write", "machine:query", "visualizer:load", "redux:read", "workspace:read", "storage", "fileSystem"],
+  "capabilities": {
+    "requestTypes": [
+      "machine:get:context",
+      "machine:command",
+      "machine:query",
+      "machine:busy:set",
+      "gcode:load:to:visualizer",
+      "redux:get:state",
+      "workspace:get:state",
+      "storage:get",
+      "storage:set",
+      "storage:delete",
+      "storage:get:all",
+      "storage:set:all",
+      "storage:clear"
+    ],
+    "topics": ["controller", "workspace"],
+    "allowedFunctions": ["machine", "gcode", "storage", "getReduxState", "getWorkspaceState", "workspace"]
+  }
+}

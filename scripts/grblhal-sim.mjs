@@ -12,6 +12,7 @@
 //   GET /reset            soft reset (Ctrl-X): ALARM:3 if moving
 //   GET /powercycle       drop the client, forget position and offsets set by G92
 //   GET /limit?axis=X     hard limit trip (ALARM:1)
+//   GET /probe?ms=1000    probe input on for a while (the screwdriver touch test)
 // The banner and $I carry "SIM" so a client can tell it from a real controller.
 import net from 'node:net';
 import http from 'node:http';
@@ -47,6 +48,7 @@ function freshMachine() {
         prb: { x: 0, y: 0, z: 0, ok: 0 },
         homed: false,
         probeTouch: false,
+        syncing: false,                    // a G38.x or G4 holds its ok (and later lines) until it is done
         reportCount: 0,
     };
 }
@@ -86,14 +88,14 @@ function settingsList() {
 
 function alarm(code, why) {
     m.state = 'Alarm'; m.alarm = code; m.sub = null;
-    m.planner = []; m.waiting = [];
+    m.planner = []; m.waiting = []; m.syncing = false;
     send(`ALARM:${code}`);
     log(`ALARM:${code} ${why}`);
 }
 
 function softReset() {
     const moving = m.state === 'Run' || m.state === 'Jog' || (m.state === 'Hold' && m.sub === 1);
-    m.planner = []; m.waiting = []; m.g92 = { x: 0, y: 0, z: 0 };
+    m.planner = []; m.waiting = []; m.syncing = false; m.g92 = { x: 0, y: 0, z: 0 };
     m.modal = { ...m.modal, motion: 'G0', spindle: 'M5', feed: 0 };
     m.probeTouch = false;
     if (moving) { m.homed = false; alarm(3, 'reset while moving'); }
@@ -157,13 +159,15 @@ function execLine(raw) {
         for (const a of axes) { const k = a.toLowerCase(); m.g92[k] = m.pos[k] - (m.wcs[m.modal.wcs][k]) - val(a) * scale; }
         return 0;
     }
-    if (g.includes(4)) { m.planner.push({ kind: 'dwell', t: (val('P') || 0) * 1000, to: at, line: raw }); return 0; }
+    // Like Grbl, G4 and G38.x wait for the planner to empty and answer ok only when they are done.
+    if (g.includes(4)) { m.planner.push({ kind: 'dwell', t: (val('P') || 0) * 1000, to: at, line: raw, sync: true }); m.syncing = true; return -1; }
     for (const n of [0, 1, 2, 3]) if (g.includes(n)) m.modal.motion = `G${n}`;
     const probe = g.find((v) => v >= 38.2 && v <= 38.5);
     if (probe) {
         if (!m.modal.feed) return 22;
-        m.planner.push({ kind: 'probe', from: at, to: target, feed: m.modal.feed, line: raw });
-        return 0;
+        m.planner.push({ kind: 'probe', from: at, to: target, feed: m.modal.feed, line: raw, sync: true });
+        m.syncing = true;
+        return -1;
     }
     if (g.includes(28) || g.includes(30)) {
         m.planner.push({ kind: 'move', from: at, to: { ...at, z: 0 }, feed: 3000, line: raw });
@@ -238,6 +242,11 @@ function dollar(line) {
 
 // --- motion -------------------------------------------------------------------
 
+/** A block left the planner: a synchronous one (G4, G38.x) gets its ok now. */
+function done(b) {
+    if (b?.sync) { m.syncing = false; send('ok'); }
+}
+
 let last = Date.now();
 setInterval(() => {
     const now = Date.now();
@@ -250,7 +259,7 @@ setInterval(() => {
         if (m.state !== 'Run' && m.state !== 'Jog') m.state = b.jog ? 'Jog' : 'Run';
         if (b.kind === 'dwell') {
             b.t -= dt; dt = 0;
-            if (b.t <= 0) { dt = -b.t; m.planner.shift(); }
+            if (b.t <= 0) { dt = -b.t; done(m.planner.shift()); }
             continue;
         }
         if (b.kind === 'pause') { m.planner.shift(); m.state = 'Hold'; m.sub = 0; send('[MSG:Pgm Pause]'); return; }
@@ -271,14 +280,14 @@ setInterval(() => {
             m.probeTouch = true;
             setTimeout(() => { m.probeTouch = false; }, 300);
             send(`[PRB:${fmt(m.pos.x)},${fmt(m.pos.y)},${fmt(m.pos.z)}:1]`);
-            m.planner.shift();
+            done(m.planner.shift());
             // Following queued blocks were planned from the old end point; restart them from here.
             if (m.planner[0]?.from) m.planner[0].from = { ...m.pos }, m.planner[0].len = undefined, m.planner[0].done = 0;
             continue;
         }
         if (b.done >= b.len) {
             if (b.kind === 'probe') { m.prb = { ...m.pos, ok: 0 }; send(`[PRB:${fmt(m.pos.x)},${fmt(m.pos.y)},${fmt(m.pos.z)}:0]`); alarm(5, 'probe did not trigger'); return; }
-            m.planner.shift();
+            done(m.planner.shift());
         }
         for (const k of ['x', 'y', 'z']) {
             const lo = -TRAVEL[k], hi = 0;
@@ -286,7 +295,7 @@ setInterval(() => {
         }
     }
     // Lines held back while the planner was full get their ok now.
-    while (m.waiting.length && m.planner.length < PLANNER) {
+    while (m.waiting.length && m.planner.length < PLANNER && !m.syncing) {
         const raw = m.waiting.shift();
         const err = execLine(raw);
         if (err >= 0) send(err ? `error:${err}` : 'ok');
@@ -316,7 +325,9 @@ const server = net.createServer((sock) => {
                 const line = buf; buf = '';
                 if (!line.trim()) continue;
                 if (TRACE) log('<<', line.trim());
-                if (m.planner.length >= PLANNER && !line.trim().startsWith('$')) { m.waiting.push(line); continue; }
+                // Like Grbl, nothing is read past a full planner or a running G4/G38.x, '$' lines included,
+                // so replies stay in order (gSender polls $G every 500 ms).
+                if (m.planner.length >= PLANNER || m.syncing || m.waiting.length) { m.waiting.push(line); continue; }
                 const err = execLine(line);
                 if (err >= 0) send(err ? `error:${err}` : 'ok');
                 continue;
@@ -347,6 +358,13 @@ http.createServer((req, res) => {
             softReset(); return reply({ ok: true, state: m.state });
         case '/limit':
             alarm(1, `hard limit ${url.searchParams.get('axis') ?? 'X'} (injected)`); return reply({ ok: true });
+        case '/probe': {
+            const ms = Number(url.searchParams.get('ms') ?? 1000);
+            m.probeTouch = true;
+            setTimeout(() => { m.probeTouch = false; }, ms);
+            log(`control: probe input on for ${ms} ms`);
+            return reply({ ok: true });
+        }
         case '/powercycle': {
             client?.destroy(); client = null;
             m = freshMachine(); m.wcs = structuredClone(wcsSaved);

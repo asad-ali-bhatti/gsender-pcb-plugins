@@ -13,6 +13,7 @@ Rules that follow from it:
 - **Every setting has a safe default,** and the common path needs no settings at all. Advanced options can exist, but they are never required and never shown first.
 - **Prevent mistakes instead of documenting them.** Examples: tie each job to its bit, level automatically, refuse a job that's out of date, warn before a cut that is too deep, block Start when the coordinates can't be trusted. Warnings are structured (`{ code, message, severity, at }`) and say what to do next.
 - **Explain in plain words.** No jargon without a short explanation. Messages name the bit, the job and the next physical action ("Insert the 0.8 mm drill, then click Zero Z").
+- **Keep UI text short.** Tips, notes and messages are one short sentence, or a few words, that still say what happened and what to do next. Users won't read paragraphs. Cut background and repetition; put rare detail in a tooltip.
 - **A human confirms every machine motion.** Plugins never start moving the machine on their own. AI agents (MCP) only generate G-code. They never load, jog, probe or run anything.
 - **Safety and reliability beat features.** A crash or a lost line during a job ruins a board and can break a bit.
 
@@ -21,7 +22,7 @@ Rules that follow from it:
 |---|---|---|
 | Autoleveler | `plugins/autoleveler` | Standalone: probe a height map, level the loaded G-code. Must keep working without the other plugins. |
 | PCB CAM | `plugins/pcb-cam` | One place for CAM: Gerber/Excellon → G-code, FlatCAM-style UI. Plan: `docs/pcb-cam-plan.md`. |
-| Project Runner | `plugins/project-runner` (planned) | Runs a PCB CAM project on the machine: job queue, bit changes, Z zeroing, built-in levelling, resume, history. Plan: `docs/project-runner-plan.md`. |
+| Project Runner | `plugins/project-runner` (Phases 1–2) | Runs a PCB CAM project on the machine: job queue, bit changes, Z zeroing, built-in levelling, resume, history. Plan: `docs/project-runner-plan.md`. |
 
 ## Hard constraints (gSender 1.7 plugin host)
 - Plugins are UI-only sandboxed iframes. There's no backend, no process spawning and no listening ports.
@@ -39,4 +40,5 @@ Rules that follow from it:
 ## Working in the repo
 - `npm test`: unit and golden tests. `npm run dev`: mock gSender host at http://localhost:8765 (simulated Grbl).
 - `node scripts/grblhal-sim.mjs --trace`: a grblHAL simulator on 127.0.0.1:2323 that real gSender connects to (network connection, IP 127.0.0.1, port 2323), with fault injection on http://127.0.0.1:2324/ (`/disconnect?hold=1`, `/reset`, `/powercycle`, `/limit`). Use it, not the user's machine, to test anything that runs jobs. Point gSender's saved connection back to the machine afterwards.
+- Project Runner carries copies of PCB CAM's `ui/core` (and clipper). Edit the source in `plugins/pcb-cam`, then run `node scripts/sync-shared.mjs`; `tests/shared.test.mjs` fails while a copy differs.
 - Installed plugins are copies in gSender's plugin folder. Re-run `npm run install-plugins` after editing, or you'll test stale code. A new plugin or a manifest change needs a gSender restart.

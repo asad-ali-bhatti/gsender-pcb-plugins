@@ -77,6 +77,8 @@ A single full-featured plugin that turns Gerber and Excellon files into G-code. 
 
 Runs a whole PCB CAM project on the machine: open the project file, pick the jobs, and follow the prompts. It inserts a bit change wherever the bit changes and walks you through zeroing Z after each one. It probes one height map per project and levels each job that needs it, exactly once. It tracks every job (done, cancelled, failed) and resumes after a lost connection or a power cut, with guidance when the machine coordinates can't be trusted. Plan: [docs/project-runner-plan.md](docs/project-runner-plan.md).
 
+Status: Phases 1–2 are in `plugins/project-runner` (▶ **Run** on the visualizer). A wizard opens a project file, checks each job against what was reviewed in PCB CAM, and lets you pick and order the jobs, with pauses or G-code steps in between. The run starts with Set X0 Y0. Bit changes are added for you: Raise Z, swap the bit, then a guided Zero Z on the copper at X0 Y0. Each job runs through gSender, and status and history are kept in a `.pcbrun.json` file. Levelling and resume come in later phases.
+
 ## License
 
 MIT. See [LICENSE](LICENSE). gSender is GPL-3.0 and is not included here; the plugins talk to it only through its plugin API.
