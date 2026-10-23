@@ -22,7 +22,7 @@ Opens as a panel on the visualizer (▦ **Autolevel** button).
 
 - **Setup**: probe area in work coordinates, or fit it to the loaded job's bounds plus a margin. Choose points per axis, travel height, probe depth, probe feed and an optional slow second probe. Can set work Z0 at the first point.
 - **Probe**: serpentine `G38.2` scan. Points appear live on the visualizer, colored by height, with optional labels and an interpolated mesh. The panel shows a hoverable heat map with min / max / range. If a scan stops, the points probed so far are kept and **Resume** finishes the rest.
-- **Apply**: rewrites the loaded job so Z follows the board and loads it as `<name>_leveled.nc`. It splits long moves into short segments, linearises `G2`/`G3` arcs, and handles mm and inch files. Heights are relative to the first point, so you can change bits and re-zero there.
+- **Apply**: rewrites the loaded job so Z follows the board and loads it as `<name>_leveled.nc`. It splits long moves into short segments, linearises `G2`/`G3` arcs, and handles mm and inch files. The map is shifted to where you zero Z for the job: by default the copper at **X0 Y0**, so after a bit change you re-zero there with gSender's probe. Work Z0 set by the scan is moved to X0 Y0 when it finishes. Keep X0 Y0 inside the probed area (the margin does that for a job that starts at the origin).
 - Import and export height maps as JSON.
 
 Before a real job, do a dry run of a small 3×3 scan with a hand on the e-stop. Probe coordinates are expected in mm (`$13=0`).

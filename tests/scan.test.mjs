@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 const { runScan, parseWcoZ, validateScanSettings } = await import(new URL('../plugins/autoleveler/ui/assets/scan.js', import.meta.url));
-const { gridPoints, createHeightMap } = await import(new URL('../plugins/autoleveler/ui/assets/leveling.js', import.meta.url));
+const { gridPoints, createHeightMap, centerPoint, probeOrder } = await import(new URL('../plugins/autoleveler/ui/assets/leveling.js', import.meta.url));
 
 /**
  * Minimal GRBL simulator. `surface(x, y)` is the board surface in machine Z.
@@ -68,6 +68,9 @@ function makeMachine({ surface, start, wcoZ, probeWorks = true }) {
 const SETTINGS = { clearance: 2, maxBelow: 1, firstTravel: 10, feed: 60, slowFeed: 15, backoff: 0.5, zeroFirst: true };
 const GRID = { xmin: 0, xmax: 20, ymin: 0, ymax: 30, nx: 3, ny: 4 };
 const tilt = (x, y) => -46.2 + 0.003 * x + 0.004 * y; // ~0.18 mm across the board
+// The scan probes the grid point nearest the middle first; heights are relative to it.
+const A = centerPoint(gridPoints(GRID));
+const ref = () => tilt(A.x, A.y);
 
 function io(machine, { pinSeq } = {}) {
     let pinCalls = 0;
@@ -87,15 +90,34 @@ async function scan(machine, opts = {}, map = createHeightMap(GRID)) {
     return map;
 }
 
-test('normal scan measures the surface relative to the first point', async () => {
+test('normal scan measures the surface relative to the first (middle) point', async () => {
     const m = makeMachine({ surface: tilt, start: { x: 50, y: 50, z: -43 }, wcoZ: -46.2 });
     const map = await scan(m);
     assert.deepEqual(m.crashes, []);
+    assert.equal(map.anchor, A.idx, 'anchor recorded');
+    assert.ok(/G0 X10 Y(10|20)/.test(m.sent.find((c) => /^G0 X/.test(c))), 'first move goes to the middle of the grid');
     for (const p of gridPoints(GRID)) {
-        assert.ok(Math.abs(map.z[p.idx] - (tilt(p.x, p.y) - tilt(0, 0))) < 1e-6, `point ${p.idx}`);
+        assert.ok(Math.abs(map.z[p.idx] - (tilt(p.x, p.y) - ref())) < 1e-6, `point ${p.idx}`);
     }
-    assert.ok(Math.abs(m.wco.z - tilt(0, 0)) < 1e-9, 'work Z0 set at first point');
+    assert.ok(Math.abs(m.wco.z - ref()) < 1e-9, 'work Z0 set at first point');
     assert.ok(!m.sent.some((c) => /^G0 Z/.test(c)), 'no absolute work-Z rapids');
+});
+
+test('with Z0 set at the job origin, the scan moves work Z0 to the copper at X0 Y0', async () => {
+    const m = makeMachine({ surface: tilt, start: { x: 50, y: 50, z: -43 }, wcoZ: -46.2 });
+    const map = await scan(m, { settings: { zeroAt: 'origin' } });
+    assert.deepEqual(m.crashes, []);
+    assert.ok(Math.abs(m.wco.z - tilt(0, 0)) < 1e-4, `work Z0 ${m.wco.z} vs copper at X0 Y0 ${tilt(0, 0)}`);
+    // The map stays relative to the first point; levelling shifts it to X0 Y0.
+    assert.ok(Math.abs(map.z[A.idx]) < 1e-9);
+});
+
+test('the panel\'s probe order matches the order the scan probes', async () => {
+    const m = makeMachine({ surface: tilt, start: { x: 50, y: 50, z: -43 }, wcoZ: -46.2 });
+    await scan(m);
+    const visited = m.sent.filter((c) => /^G0 X/.test(c));
+    const expected = probeOrder(gridPoints(GRID)).map((p) => `G0 X${p.x} Y${p.y}`);
+    assert.deepEqual(visited, expected);
 });
 
 test('stale Z0 (new, 5 mm longer bit, not re-zeroed) does not crash', async () => {
@@ -103,7 +125,7 @@ test('stale Z0 (new, 5 mm longer bit, not re-zeroed) does not crash', async () =
     const m = makeMachine({ surface: tilt, start: { x: 50, y: 50, z: -44 }, wcoZ: -51.2 });
     const map = await scan(m);
     assert.deepEqual(m.crashes, []);
-    assert.ok(Math.abs(map.z[11] - (tilt(20, 30) - tilt(0, 0))) < 1e-6);
+    assert.ok(Math.abs(map.z[11] - (tilt(20, 30) - ref())) < 1e-6);
 });
 
 test('Z0 far above the surface is also fine', async () => {
@@ -140,10 +162,29 @@ test('touch test passes when the pin closes and opens', async () => {
 test('dead probe without the touch test plunges at most the capped first travel', async () => {
     const m = makeMachine({ surface: tilt, start: { x: 50, y: 50, z: -43 }, wcoZ: -46.2, probeWorks: false });
     await assert.rejects(scan(m), /without touching/);
-    // starts 3.2 mm above the first point's surface, lifts 2, probes 12 → 6.8 mm past it:
+    // starts (-43 - surface) above the first point's surface, lifts 2, probes 12:
     // bounded by firstTravel + clearance, never the old -30.
+    const past = (12 - (-43 - ref()) - 2).toFixed(2);
     assert.equal(m.crashes.length, 1);
-    assert.match(m.crashes[0], /drove 6\.80 mm/);
+    assert.match(m.crashes[0], new RegExp(`drove ${past} mm`));
+});
+
+test('dead probe with Z0 on the copper stops 1 mm below Z0, not the full first travel', async () => {
+    // Z0 set on the surface with gSender's touch plate; the board copper isn't wired to the probe.
+    const m = makeMachine({ surface: tilt, start: { x: 50, y: 50, z: -43 }, wcoZ: ref(), probeWorks: false });
+    const workZ = async () => m.pos.z - m.wco.z;
+    await assert.rejects(
+        runScan({ ...io(m), readWorkZ: workZ }, SETTINGS, createHeightMap(GRID), gridPoints(GRID), { touchTest: false }),
+        /1 mm below work Z0 without touching.*board's copper/);
+    assert.equal(m.crashes.length, 1);
+    assert.match(m.crashes[0], /drove 1\.00 mm/);
+});
+
+test('Z0 below the bit start but far away keeps the configured first travel', async () => {
+    const m = makeMachine({ surface: tilt, start: { x: 50, y: 50, z: -43 }, wcoZ: -60 });
+    const map = createHeightMap(GRID);
+    await runScan({ ...io(m), readWorkZ: async () => m.pos.z - m.wco.z }, SETTINGS, map, gridPoints(GRID), { touchTest: false });
+    assert.deepEqual(m.crashes, []);
 });
 
 test('later probes stop at maxBelow under the first surface', async () => {
@@ -194,5 +235,18 @@ test('grblHAL: work offset comes from status reports, no $ commands are sent', a
     assert.deepEqual(m.crashes, []);
     assert.ok(!m.sent.some((c) => c.startsWith('$')), 'no $ commands');
     assert.deepEqual(calls, [{ atCurrent: true }]);
-    for (const p of gridPoints(GRID)) assert.ok(Math.abs(map.z[p.idx] - (tilt(p.x, p.y) - tilt(0, 0))) < 1e-6, `point ${p.idx}`);
+    for (const p of gridPoints(GRID)) assert.ok(Math.abs(map.z[p.idx] - (tilt(p.x, p.y) - ref())) < 1e-6, `point ${p.idx}`);
+});
+
+test('margin off the copper: the first probe is still on the board', async () => {
+    // The blank starts at X0 Y0; the 1 mm margin puts the corner points off the copper
+    // (over the spoilboard, 1.6 mm lower). The old corner-first scan probed there first.
+    const offBlank = (x, y) => (x < 0 || y < 0 ? tilt(0, 0) - 1.6 : tilt(x, y));
+    const g = { xmin: -1, xmax: 21, ymin: -1, ymax: 26, nx: 3, ny: 3 };
+    const m = makeMachine({ surface: offBlank, start: { x: 50, y: 50, z: -43 }, wcoZ: -46.2 });
+    const map = createHeightMap(g);
+    await assert.rejects(runScan(io(m), SETTINGS, map, gridPoints(g), { touchTest: false }), /travelled 3 mm down without touching/);
+    const first = gridPoints(g).find((p) => p.idx === map.anchor);
+    assert.ok(first.x > 0 && first.y > 0, 'reference point is on the copper');
+    assert.deepEqual(m.crashes, [], 'off-board points stop above the spoilboard (maxBelow), no crash');
 });

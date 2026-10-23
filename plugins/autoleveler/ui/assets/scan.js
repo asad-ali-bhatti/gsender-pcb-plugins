@@ -11,7 +11,7 @@
 //     taken from the probe's own [PRB:] report, never from a cached offset.
 //   * Probe distances are capped (see LIMITS), whatever the settings say.
 
-import { parsePRB, fmt } from './leveling.js';
+import { parsePRB, fmt, anchorIdx, centerPoint, zeroHeight } from './leveling.js';
 
 export const LIMITS = {
     clearance: [0.5, 10],   // mm above the first surface for travel
@@ -21,6 +21,8 @@ export const LIMITS = {
     slowFeed: [0, 100],
     backoff: [0.1, 2],
 };
+
+const Z0_MARGIN = 1; // mm the first probe may go below work Z0 when Z0 is above the bit's start
 
 export function validateScanSettings(s) {
     const errs = [];
@@ -87,17 +89,17 @@ export async function runScan(io, s, map, pts, { resume = false, touchTest = tru
     const rel = async (cmd, opts) => {
         try { return await send(`G91 ${cmd}`, opts); } finally { await io.send('G90', {}).catch(() => {}); }
     };
-    const probeDown = async (dist, feed) => {
+    const probeDown = async (dist, feed, missed) => {
         const timeout = 15000 + (dist / feed) * 60000;
         const lines = await rel(`G38.2 Z-${fmt(dist)} F${fmt(feed, 1)}`, { probe: true, timeout });
         const prb = parsePRB(lines);
         const bad = lines.find((l) => FAIL_RE.test(String(l).trim()));
         if (!prb) throw new Error(bad ? `Probe failed: ${bad}` : 'Probe gave no result. Check the probe wiring.');
-        if (!prb.ok) throw new Error(`Probe travelled ${fmt(dist, 2)} mm down without touching. Nothing was cut; check the clip/wiring, or start with the bit closer to the board.`);
+        if (!prb.ok) throw new Error(missed ?? `Probe travelled ${fmt(dist, 2)} mm down without touching. Check that the probe lead is clipped to the board's copper (not the touch plate) and the clip is on the bit, or start with the bit closer to the board.`);
         return prb;
     };
-    const touch = async (dist) => {
-        let prb = await probeDown(dist, s.feed);
+    const touch = async (dist, missed) => {
+        let prb = await probeDown(dist, s.feed, missed);
         if (s.slowFeed > 0) {
             await rel(`G0 Z${fmt(s.backoff)}`);
             prb = await probeDown(s.backoff + 0.5, s.slowFeed);
@@ -125,7 +127,7 @@ export async function runScan(io, s, map, pts, { resume = false, touchTest = tru
     // 1. Probe input sanity: must be open now, and must close when touched.
     if (await io.probePin()) throw new Error('Probe input is already triggered before touching anything. Check the clip and wiring (or the $6 probe-invert setting).');
     if (touchTest) {
-        io.status('Probe test: touch the probe lead to the bit and hold for a second…');
+        io.status('Probe test: with the probe lead clipped to the board copper and the clip on the bit, bridge the bit and the copper (e.g. with a screwdriver) for a second…');
         await waitPin(true, 30000, 'The probe input never triggered during the touch test. Check the clip and wiring.');
         io.status('Probe works. Let go and leave the clip attached for the scan…');
         await waitPin(false, 30000, 'The probe input stayed triggered. Let go of the clip before scanning.');
@@ -135,19 +137,38 @@ export async function runScan(io, s, map, pts, { resume = false, touchTest = tru
     await send('G21');
     await send('G90');
 
+    // Work Z before lifting. When Z0 is on the copper (set with gSender's probe or
+    // a previous scan), the surface is about that far below, so the first probe
+    // needn't go more than Z0_MARGIN past Z0. If the board copper isn't wired to
+    // the probe input, the bit then stops just under the surface instead of
+    // driving the full first travel into the board.
+    const startZ = io.readWorkZ ? await io.readWorkZ() : null;
+
     const remaining = pts.filter((p) => !Number.isFinite(map.z[p.idx]));
     if (!remaining.length) return;
 
     // 2. Find the surface without trusting Z0: lift a little, move over the
     //    anchor point, probe down a bounded distance. On a new scan the anchor
-    //    is the first point; on resume it is the already-measured point 0, which
-    //    must still read the same height or the work zero has changed.
-    const anchor = resume ? pts.find((p) => p.idx === 0 && Number.isFinite(map.z[0])) : remaining[0];
+    //    is the point nearest the middle of the grid, which is on the board even
+    //    when the margin reaches past the copper (a corner point off the blank
+    //    would let the bit go down without ever touching). On resume it is the
+    //    already-measured anchor, which must still read the same height or the
+    //    work zero has changed.
+    const anchor = resume
+        ? pts.find((p) => p.idx === anchorIdx(map) && Number.isFinite(map.z[p.idx]))
+        : centerPoint(remaining);
     if (!anchor) throw new Error('Nothing to resume from: the first point was never measured. Start a new scan.');
     io.status(`Finding the surface at X${fmt(anchor.x, 2)} Y${fmt(anchor.y, 2)}…`);
     await rel(`G0 Z${fmt(s.clearance)}`);
     await send(`G0 X${fmt(anchor.x)} Y${fmt(anchor.y)}`);
-    const first = await touch(s.firstTravel + s.clearance);
+    let firstDist = s.firstTravel + s.clearance;
+    let missed;
+    if (Number.isFinite(startZ) && startZ > 0 && startZ + s.clearance + Z0_MARGIN < firstDist) {
+        firstDist = startZ + s.clearance + Z0_MARGIN;
+        missed = `Probe reached ${fmt(Z0_MARGIN, 1)} mm below work Z0 without touching. If Z0 is on the board, the board copper is not in the probe circuit: clip the probe lead to the board's copper (not the touch plate), keep the clip on the bit, and run the touch test.`;
+        io.log(`First probe limited to ${fmt(firstDist, 2)} mm: ${fmt(Z0_MARGIN, 1)} mm below work Z0`);
+    }
+    const first = await touch(firstDist, missed);
     const travelMZ = first.z + s.clearance;   // machine Z for all travel
     const floorDist = s.clearance + s.maxBelow; // probe distance from travel height
 
@@ -155,18 +176,19 @@ export async function runScan(io, s, map, pts, { resume = false, touchTest = tru
     if (resume) {
         wcoZ = await readWcoZ();
         const zw = first.z - wcoZ;
-        if (Math.abs(zw - map.z[0]) > 0.02) {
+        if (Math.abs(zw - map.z[anchor.idx]) > 0.02) {
             await send(`G53 G0 Z${fmt(travelMZ)}`);
-            throw new Error(`The first point now reads Z${fmt(zw, 3)} but was Z${fmt(map.z[0], 3)} when scanned: work zero or the bit changed. Start a new scan.`);
+            throw new Error(`The first point now reads Z${fmt(zw, 3)} but was Z${fmt(map.z[anchor.idx], 3)} when scanned: work zero or the bit changed. Start a new scan.`);
         }
     } else {
         if (s.zeroFirst) {
             await send('G10 L20 P0 Z0');
-            io.log('Work Z zeroed at the first point');
+            io.log(`Work Z zeroed at the middle point X${fmt(anchor.x, 2)} Y${fmt(anchor.y, 2)}`);
         }
         wcoZ = await readWcoZ(!!s.zeroFirst);
         map.wcoZ = wcoZ;
         const zw = s.zeroFirst ? 0 : first.z - wcoZ;
+        map.anchor = anchor.idx;
         map.z[anchor.idx] = zw;
         io.onPoint(anchor, zw);
     }
@@ -184,5 +206,18 @@ export async function runScan(io, s, map, pts, { resume = false, touchTest = tru
         map.z[p.idx] = zw;
         io.onPoint(p, zw);
         await send(`G53 G0 Z${fmt(travelMZ)}`);
+    }
+
+    // 4. The scan set Z0 on its first point; when the job is zeroed at X0 Y0,
+    //    move Z0 to the copper there (interpolated from the map), so the bit
+    //    that scanned can cut without re-zeroing.
+    if (s.zeroFirst && s.zeroAt === 'origin') {
+        const zero = zeroHeight(map, 'origin');
+        if (zero.beyond <= 0.01) {
+            await send(`G10 L20 P0 Z${fmt(travelMZ - wcoZ - zero.z)}`);
+            io.log(`Work Z0 moved to the copper at X0 Y0 (${fmt(zero.z, 3)} mm from the first point)`);
+        } else {
+            io.log(`X0 Y0 is outside the probed area: work Z0 stays at the first point`);
+        }
     }
 }

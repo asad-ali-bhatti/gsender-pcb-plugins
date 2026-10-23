@@ -1,7 +1,7 @@
 import { machine, viewer, gcode, storage, getReduxState } from '@sienci/gsender-plugin-sdk';
 import { installIcons, icon } from './icons.js';
 import {
-    gridPoints, createHeightMap, validateGrid, isComplete, mapStats, heightAt, parsePRB, levelGcode, fmt,
+    gridPoints, createHeightMap, validateGrid, isComplete, mapStats, heightAt, parsePRB, levelGcode, fmt, anchorIdx, zeroHeight, ZERO_AT, centerPoint, probeOrder, cutPaths,
 } from './leveling.js';
 import { runScan, validateScanSettings } from './scan.js';
 
@@ -22,7 +22,7 @@ const DEFAULTS = {
     backoff: 0.5,      // retract before second probe
     zeroFirst: true,   // G10 L20 Z0 at the first point
     segment: 1,        // max segment length when levelling
-    reference: 'first',
+    zeroAt: 'origin',  // where work Z0 is set for the job: origin (X0 Y0) | scan | absolute
     showOverlay: true,
     showLabels: true,
     showMesh: true,
@@ -102,7 +102,11 @@ function colorRGB(t) {
 const colorCss = (t) => `rgb(${colorRGB(t).join(',')})`;
 const gradientCss = () => `linear-gradient(90deg, ${STOPS.map((c) => `rgb(${c.join(',')})`).join(',')})`;
 
-const refZ = () => (state.s.reference === 'absolute' || !state.map || !Number.isFinite(state.map.z[0]) ? 0 : state.map.z[0]);
+const refZ = () => {
+    if (!state.map) return 0;
+    const z = zeroHeight(state.map, state.s.zeroAt).z; // NaN until the cells around X0 Y0 are probed
+    return Number.isFinite(z) ? z : 0;
+};
 
 // ---------------------------------------------------------------------------
 // Visualizer overlay
@@ -302,6 +306,7 @@ async function readMachine() {
 }
 
 async function startScan({ resume = false } = {}) {
+    state.confirmClear = false;
     const s = state.s;
     const grid = gridOf(s);
     const errs = [...validateGrid(grid), ...validateScanSettings(s)];
@@ -317,7 +322,7 @@ async function startScan({ resume = false } = {}) {
     if (!m.connected) { setMsg('err', 'Connect to the machine first.'); return; }
     if (m.activeState !== 'Idle') { setMsg('err', `Machine is ${m.activeState}. It must be Idle (unlock / home first).`); return; }
 
-    if (!(resume && state.map && sameGrid(state.map, grid) && !isComplete(state.map) && Number.isFinite(state.map.z[0]))) {
+    if (!(resume && state.map && sameGrid(state.map, grid) && !isComplete(state.map) && Number.isFinite(state.map.z[anchorIdx(state.map)]))) {
         state.map = createHeightMap(grid);
         resume = false;
     }
@@ -332,6 +337,11 @@ async function startScan({ resume = false } = {}) {
         send: sendLine,
         probePin,
         readWcoZ,
+        readWorkZ: async () => {
+            const st = (await getReduxState())?.controller?.state?.status ?? {};
+            const z = Number(st.wpos?.z);
+            return st.activeState === 'Idle' && Number.isFinite(z) ? z : null;
+        },
         aborted: () => state.abort,
         sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
         log,
@@ -383,11 +393,36 @@ async function refreshFile() {
     try {
         const { file } = await readMachine();
         state.file = file?.fileLoaded && file.content ? file : null;
+        updateShadow();
     } catch (e) {
         state.file = null;
         setMsg('err', e.message);
     }
     render();
+}
+
+/**
+ * The loaded job's cutting moves as one Path2D in mm, drawn under the probe
+ * preview. Rebuilt only when the loaded file changes.
+ */
+function updateShadow() {
+    const f = state.file;
+    const key = f ? `${f.name}:${f.content.length}` : null;
+    if (state.shadow?.key === key) return;
+    if (!f) { state.shadow = null; return; }
+    const path = new Path2D();
+    for (const pl of cutPaths(f.content)) {
+        pl.forEach(([x, y], i) => (i ? path.lineTo(x, y) : path.moveTo(x, y)));
+    }
+    state.shadow = { key, path };
+}
+
+/** The probe area was set from the file bounds (plus margin) and hasn't been edited since. */
+function usingFileBounds() {
+    const b = state.s.fileBbox;
+    if (!b) return false;
+    const f = fileBoundsWith(state.s.margin || 0);
+    return ['xmin', 'xmax', 'ymin', 'ymax'].every((k) => Math.abs(state.s[k] - f[k]) < 1e-6);
 }
 
 function fileBoundsWith(m) {
@@ -441,7 +476,7 @@ async function applyLevel() {
         src = state.source;
     }
     try {
-        const r = levelGcode(src.content, state.map, { segment: state.s.segment, reference: state.s.reference });
+        const r = levelGcode(src.content, state.map, { segment: state.s.segment, zeroAt: state.s.zeroAt });
         const name = String(src.name || 'job.nc').replace(/(\.[^.]+)?$/, (ext) => `_leveled${ext || '.nc'}`);
         await gcode.loadToVisualizer(r.gcode, name);
         state.source = { name: src.name, content: src.content, leveledName: name };
@@ -543,15 +578,37 @@ function updateProgress() {
     txt.textContent = `${done} / ${state.map.z.length} points${state.current ? ` — probing X${fmt(state.current.x, 2)} Y${fmt(state.current.y, 2)}` : ''}`;
 }
 
+/** What the "Z0 set at" choice means for this map, with X0 Y0's height when known. */
+function zeroNote(map) {
+    const z = state.s.zeroAt;
+    if (z === 'absolute') return 'Keep the work Z0 the scan used. Don\'t re-zero Z before running the levelled job.';
+    if (z === 'scan') {
+        const p = map && gridPoints(map).find((q) => q.idx === anchorIdx(map));
+        return `After a bit change, zero Z on the copper at the grid's middle point${p ? `, X${fmt(p.x, 2)} Y${fmt(p.y, 2)}` : ''} (where the scan probed first).`;
+    }
+    let extra = '';
+    if (map && isComplete(map)) {
+        const h = zeroHeight(map, 'origin');
+        extra = h.beyond > 0.01
+            ? ` ⚠ X0 Y0 is outside the probed area: probe an area that includes it.`
+            : ` Copper at X0 Y0 is ${fmt(h.z - map.z[anchorIdx(map)], 3)} mm from the grid's middle point.`;
+    }
+    return `After a bit change, zero Z on the copper at X0 Y0 (gSender's probe, plate thickness 0 on the board copper). A scan that sets Z0 also moves it to X0 Y0 when it finishes.${extra}`;
+}
+
 function renderHeat() {
     const box = $('#heat');
     if (!box) return;
     box.replaceChildren();
-    const map = state.map;
-    if (!map) { box.append(h('div', { className: 'note' }, 'No height map yet.')); return; }
+    // Same rule as the visualizer: the stored map while it matches the Setup
+    // grid (or a scan is running), otherwise the points a new scan would probe.
+    const setupGrid = validateGrid(gridOf(state.s)).length ? null : gridOf(state.s);
+    const map = state.map && (state.scanning || !setupGrid || sameGrid(state.map, setupGrid)) ? state.map : null;
+    const grid = map ?? setupGrid;
+    if (!grid) { box.append(h('div', { className: 'note' }, 'No height map yet. Set a valid probe area in Setup to preview the points.')); return; }
 
-    const st = mapStats(map);
-    const ref = refZ();
+    const st = map ? mapStats(map) : null;
+    const ref = map ? refZ() : 0;
     if (st) {
         box.append(h('div', { className: 'stats' },
             h('div', {}, h('b', {}, fmt(st.min - ref, 3)), h('span', {}, 'min mm')),
@@ -566,18 +623,22 @@ function renderHeat() {
     box.append(wrap);
 
     const cssW = box.clientWidth || 280;
-    const aspect = (map.ymax - map.ymin) / (map.xmax - map.xmin);
+    const aspect = (grid.ymax - grid.ymin) / (grid.xmax - grid.xmin);
     const cssH = Math.max(80, Math.min(240, cssW * aspect));
     const dpr = window.devicePixelRatio || 1;
     canvas.width = Math.round(cssW * dpr);
     canvas.height = Math.round(cssH * dpr);
     canvas.style.height = `${cssH}px`;
     const ctx = canvas.getContext('2d');
-    const W = canvas.width, H = canvas.height, pad = 8 * dpr;
-    const toPx = (x, y) => [pad + ((x - map.xmin) / (map.xmax - map.xmin)) * (W - 2 * pad), H - pad - ((y - map.ymin) / (map.ymax - map.ymin)) * (H - 2 * pad)];
+    const W = canvas.width, H = canvas.height, pad = 12 * dpr;
+    const toPx = (x, y) => [pad + ((x - grid.xmin) / (grid.xmax - grid.xmin)) * (W - 2 * pad), H - pad - ((y - grid.ymin) / (grid.ymax - grid.ymin)) * (H - 2 * pad)];
     const norm = (z) => (st && st.range > 0 ? (z - st.min) / st.range : 0.5);
+    const css = getComputedStyle(document.documentElement);
+    const textC = css.getPropertyValue('--text').trim() || '#1f2328';
+    const haloC = css.getPropertyValue('--panel').trim() || '#f4f5f7';
+    const accentC = css.getPropertyValue('--accent').trim() || '#0a9e78';
 
-    if (isComplete(map)) {
+    if (map && isComplete(map)) {
         const img = ctx.createImageData(W, H);
         for (let py = 0; py < H; py++) {
             for (let px = 0; px < W; px++) {
@@ -591,8 +652,49 @@ function renderHeat() {
         }
         ctx.putImageData(img, 0, 0);
     }
-    for (const p of gridPoints(map)) {
-        const z = map.z[p.idx];
+
+    // The job's footprint when the area comes from the file bounds: its
+    // outline box, and the cutting moves of the loaded file.
+    if (usingFileBounds()) {
+        const b = state.s.fileBbox;
+        const [x0, y0] = toPx(b.xmin, b.ymax), [x1, y1] = toPx(b.xmax, b.ymin);
+        ctx.save();
+        ctx.fillStyle = textC;
+        ctx.globalAlpha = 0.07;
+        ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+        ctx.globalAlpha = 0.35;
+        ctx.lineWidth = 1 * dpr;
+        ctx.strokeStyle = textC;
+        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+        if (state.shadow) {
+            const sx = (W - 2 * pad) / (grid.xmax - grid.xmin), sy = (H - 2 * pad) / (grid.ymax - grid.ymin);
+            ctx.translate(pad - grid.xmin * sx, H - pad + grid.ymin * sy);
+            ctx.scale(sx, -sy);
+            ctx.lineWidth = dpr / Math.min(sx, sy);
+            ctx.globalAlpha = 0.5;
+            ctx.stroke(state.shadow.path);
+        }
+        ctx.restore();
+    }
+
+    // Probe order: the anchor (first probe, sets Z0) then the serpentine.
+    const pts = gridPoints(grid);
+    const measured = map && Number.isFinite(map.z[anchorIdx(map)]);
+    const anchor = measured ? pts.find((p) => p.idx === anchorIdx(map)) : centerPoint(pts);
+    const order = probeOrder(pts, anchor);
+
+    ctx.save();
+    ctx.setLineDash([3 * dpr, 3 * dpr]);
+    ctx.lineWidth = 1 * dpr;
+    ctx.strokeStyle = textC;
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath();
+    order.forEach((p, i) => { const [px, py] = toPx(p.x, p.y); if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); });
+    ctx.stroke();
+    ctx.restore();
+
+    for (const p of pts) {
+        const z = map ? map.z[p.idx] : NaN;
         const [px, py] = toPx(p.x, p.y);
         ctx.beginPath();
         ctx.arc(px, py, 3.5 * dpr, 0, Math.PI * 2);
@@ -608,15 +710,55 @@ function renderHeat() {
             ctx.stroke();
         }
     }
+    // X0 Y0, where you zero Z for the job (default "Z0 set at").
+    if (grid.xmin <= 0 && grid.xmax >= 0 && grid.ymin <= 0 && grid.ymax >= 0) {
+        const [ox, oy] = toPx(0, 0);
+        ctx.beginPath();
+        ctx.arc(ox, oy, 3.5 * dpr, 0, Math.PI * 2);
+        ctx.fillStyle = '#e5484d';
+        ctx.fill();
+        ctx.lineWidth = 1 * dpr;
+        ctx.strokeStyle = 'rgba(0,0,0,.6)';
+        ctx.stroke();
+    }
+
+    const [ax, ay] = toPx(anchor.x, anchor.y);
+    ctx.beginPath();
+    ctx.arc(ax, ay, 6.5 * dpr, 0, Math.PI * 2);
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.strokeStyle = accentC;
+    ctx.stroke();
+
+    // Numbers, when the points are far enough apart to read them; the first
+    // and last always.
+    const gap = Math.min(
+        grid.nx > 1 ? (W - 2 * pad) / (grid.nx - 1) : Infinity,
+        grid.ny > 1 ? (H - 2 * pad) / (grid.ny - 1) : Infinity);
+    const all = gap >= 18 * dpr;
+    ctx.font = `600 ${9 * dpr}px system-ui, sans-serif`;
+    ctx.textBaseline = 'bottom';
+    ctx.lineJoin = 'round';
+    order.forEach((p, i) => {
+        if (!all && i !== 0 && i !== order.length - 1) return;
+        const [px, py] = toPx(p.x, p.y);
+        const label = String(i + 1);
+        const tw = ctx.measureText(label).width;
+        const tx = Math.min(px + 4 * dpr, W - tw - 1), ty = Math.max(py - 3 * dpr, 10 * dpr);
+        ctx.lineWidth = 3 * dpr;
+        ctx.strokeStyle = haloC;
+        ctx.strokeText(label, tx, ty);
+        ctx.fillStyle = i === 0 ? accentC : textC;
+        ctx.fillText(label, tx, ty);
+    });
 
     canvas.addEventListener('mousemove', (e) => {
         const r = canvas.getBoundingClientRect();
         const px = (e.clientX - r.left) * dpr, py = (e.clientY - r.top) * dpr;
-        const x = map.xmin + ((px - pad) / (W - 2 * pad)) * (map.xmax - map.xmin);
-        const y = map.ymin + ((H - pad - py) / (H - 2 * pad)) * (map.ymax - map.ymin);
-        if (x < map.xmin || x > map.xmax || y < map.ymin || y > map.ymax) { tip.style.display = 'none'; return; }
+        const x = grid.xmin + ((px - pad) / (W - 2 * pad)) * (grid.xmax - grid.xmin);
+        const y = grid.ymin + ((H - pad - py) / (H - 2 * pad)) * (grid.ymax - grid.ymin);
+        if (x < grid.xmin || x > grid.xmax || y < grid.ymin || y > grid.ymax) { tip.style.display = 'none'; return; }
         let text = `X${fmt(x, 2)} Y${fmt(y, 2)}`;
-        if (isComplete(map)) text += `  Z${fmt(heightAt(map, x, y).z - ref, 3)}`;
+        if (map && isComplete(map)) text += `  Z${fmt(heightAt(map, x, y).z - ref, 3)}`;
         tip.textContent = text;
         tip.style.display = 'block';
         tip.style.left = `${Math.min(e.clientX - r.left + 10, r.width - 130)}px`;
@@ -630,6 +772,8 @@ function renderHeat() {
             h('div', { className: 'bar', style: `background:${gradientCss()}` }),
             h('span', {}, fmt(st.max - ref, 3))));
     }
+    box.append(h('div', { className: 'note' },
+        `Numbers are the probe order. Ringed: probed first, sets Z0${state.s.zeroFirst && state.s.zeroAt === 'origin' ? ' (moved to X0 Y0 when the scan finishes)' : ''}. Red dot: X0 Y0 (zero Z here).${usingFileBounds() ? ' Shaded: the loaded job.' : ''}`));
 }
 
 function tabSetup() {
@@ -656,15 +800,15 @@ function tabSetup() {
         h('div', { className: 'section' },
             h('h4', {}, 'Probing'),
             h('div', { className: 'grid2' },
-                num('clearance', 'Travel height', { icon: 's-probeheight', tip: 'How far (mm) above the first point\'s surface the bit travels between points (0.5–10). Must clear clamps.' }),
-                num('maxBelow', 'Max depth below first point', { icon: 's-maxbelow', tip: 'How far (mm) below the first point\'s surface any later probe may go before the scan stops (0.1–3). A board is never off by more than this.' }),
+                num('clearance', 'Travel height', { icon: 's-probeheight', tip: 'How far (mm) above the copper at the middle point (the first probe) the bit travels between points (0.5–10). Must clear clamps.' }),
+                num('maxBelow', 'Max depth below middle point', { icon: 's-maxbelow', tip: 'How far (mm) below the copper at the middle point any later probe may go before the scan stops (0.1–3). A board is never off by more than this.' }),
                 num('firstTravel', 'First probe max travel', { tip: 'The first probe searches down at most this far (mm) from where the bit starts (1–25). Start with the bit a few mm above the board.' }),
                 num('feed', 'Probe feed', { min: 1, tip: 'Feed (mm/min) of the first, fast probe move.' }),
                 num('slowFeed', 'Slow re-probe feed (0 = off)', { min: 0, tip: 'After contact, back off and probe again at this slower feed (mm/min) for a more accurate reading. 0 skips it.' }),
                 num('backoff', 'Re-probe back-off', { icon: 's-backoff', tip: 'How far (mm) to lift after the first contact before the slow re-probe.' })),
-            chk('zeroFirst', 'Set work Z0 at first point', null, 'Set work Z0 where the first point touches, so all heights are relative to it.'),
+            chk('zeroFirst', 'Zero Z during the scan', null, 'The scan zeroes Z on the copper at its first probe, the grid point nearest the middle. With "Z0 set at: Job origin X0 Y0" (Levelling), it then moves Z0 to the copper at X0 Y0 when it finishes, so the scanning bit can cut without re-zeroing. Off: work Z0 is left as it was.'),
             chk('probeTest', 'Touch-test the probe before scanning', null, 'Before anything moves, wait until you touch the probe lead to the bit, so a broken probe circuit is caught first.'),
-            h('div', { className: 'note' }, 'Jog the bit a few mm above the board and attach the probe clip. The scan finds the surface itself at the first point; the current Z0 is not used for any move.')),
+            h('div', { className: 'note' }, 'Jog the bit a few mm above the board and clip the probe lead to the board copper. The scan probes the middle of the grid first (always on the board, even when the margin isn\'t), then the rest. Heights are measured from that middle point; where Z0 has to be for the job is set under Levelling.')),
         h('div', { className: 'section' },
             h('h4', {}, 'Visualizer'),
             chk('showOverlay', 'Show grid / map on visualizer', drawOverlay, 'Draw probe points (or the probed heights) in the gSender visualizer.'),
@@ -676,6 +820,29 @@ function tabSetup() {
     ];
 }
 
+/** Clearing deletes probed data, so it asks first (inline: the iframe has no confirm()). */
+function askClear() { state.confirmClear = true; render(); }
+
+function clearConfirm() {
+    const n = state.map ? state.map.z.filter(Number.isFinite).length : 0;
+    return h('div', { className: 'confirm' },
+        h('div', {}, h('b', {}, 'Clear the height map? '),
+            `The ${n} probed point${n === 1 ? '' : 's'} will be deleted and can't be restored (export it first if you may need it). A levelled job already loaded in gSender is not changed.`),
+        h('div', { className: 'row' },
+            h('button', {
+                className: 'b danger',
+                onClick: () => {
+                    state.map = null;
+                    state.confirmClear = false;
+                    storage.delete('map').catch(() => {});
+                    setMsg('info', 'Height map cleared.');
+                    render();
+                    drawOverlay();
+                },
+            }, 'Clear map'),
+            h('button', { className: 'b', onClick: () => { state.confirmClear = false; render(); } }, 'Cancel')));
+}
+
 function tabProbe() {
     const canResume = state.map && !isComplete(state.map) && sameGrid(state.map, gridOf(state.s)) && state.map.z.some(Number.isFinite);
     const stale = state.map && !sameGrid(state.map, gridOf(state.s));
@@ -684,7 +851,9 @@ function tabProbe() {
             state.scanning
                 ? h('button', { className: 'b danger', onClick: stopScan }, '■ Stop')
                 : h('button', { className: 'b primary withic', onClick: () => startScan() }, icon('b-probe'), state.map ? 'New scan' : 'Start scan'),
-            !state.scanning && canResume ? h('button', { className: 'b', onClick: () => startScan({ resume: true }) }, 'Resume') : null),
+            !state.scanning && canResume ? h('button', { className: 'b', onClick: () => startScan({ resume: true }) }, 'Resume') : null,
+            !state.scanning && state.map ? h('button', { className: 'b grow0', onClick: askClear }, 'Clear') : null),
+        state.confirmClear ? clearConfirm() : null,
         stale ? h('div', { className: 'note' }, 'Setup grid differs from the stored map. A new scan will use the Setup grid.') : null,
         h('div', { className: 'progress' }, h('div', { id: 'bar', style: 'width:0%' })),
         h('div', { className: 'note', id: 'progtxt' }, state.map ? '' : 'Ready.'),
@@ -717,13 +886,14 @@ function tabApply() {
             h('h4', {}, 'Levelling'),
             h('div', { className: 'grid2' },
                 num('segment', 'Max segment (mm)', { min: 0.1, tip: 'Long moves are split into pieces no longer than this so Z can follow the surface. Smaller = more accurate, larger file.' }),
-                h('label', { className: 'f' }, tipLabel('Z reference', 'Which Z the height map is measured against when levelling.'),
+                h('label', { className: 'f' }, tipLabel('Z0 set at', 'Where work Z0 is on the copper when the levelled job runs. The map is shifted so that spot cuts at the programmed depth.'),
                     h('select', {
-                        onChange: (e) => { state.s.reference = e.target.value; saveSettings(); renderHeat(); drawOverlay(); },
+                        onChange: (e) => { state.s.zeroAt = e.target.value; saveSettings(); render(); drawOverlay(); },
                     },
-                    h('option', { value: 'first', selected: state.s.reference === 'first' }, 'First point'),
-                    h('option', { value: 'absolute', selected: state.s.reference === 'absolute' }, 'Absolute work Z')))),
-            h('div', { className: 'note' }, 'First point: heights are relative to the first probe point, so you can change bits and re-zero Z there. Absolute: keep the Z0 used during the scan.'),
+                    h('option', { value: 'origin', selected: state.s.zeroAt === 'origin' }, 'Job origin X0 Y0'),
+                    h('option', { value: 'scan', selected: state.s.zeroAt === 'scan' }, 'Grid middle (first probe)'),
+                    h('option', { value: 'absolute', selected: state.s.zeroAt === 'absolute' }, 'Z0 used during the scan')))),
+            h('div', { className: 'note' }, zeroNote(map)),
             h('div', { className: 'row' },
                 h('button', { className: 'b primary withic', disabled: !isComplete(map) || state.scanning, onClick: applyLevel }, icon('b-level'), 'Apply & load levelled G-code'))),
         h('div', { className: 'section' },
@@ -737,11 +907,8 @@ function tabApply() {
                 type: 'file', id: 'file', accept: '.json,application/json', style: 'display:none',
                 onChange: async (e) => { const file = e.target.files?.[0]; if (file) importMap(await file.text()); e.target.value = ''; },
             }),
-            h('div', { className: 'row' },
-                h('button', {
-                    className: 'b', disabled: !map || state.scanning,
-                    onClick: () => { state.map = null; storage.delete('map').catch(() => {}); setMsg('info', 'Height map cleared.'); render(); drawOverlay(); },
-                }, 'Clear map'))),
+            state.confirmClear ? clearConfirm() : h('div', { className: 'row' },
+                h('button', { className: 'b', disabled: !map || state.scanning, onClick: askClear }, 'Clear map'))),
     ];
 }
 
@@ -750,7 +917,7 @@ function render() {
     const status = h('div', { className: 'conn', id: 'conn' });
     const tabs = h('div', { className: 'tabs' },
         ...[['setup', 'Setup'], ['probe', 'Probe'], ['apply', 'Apply']].map(([id, label]) =>
-            h('button', { className: state.tab === id ? 'active' : '', onClick: () => { state.tab = id; if (id === 'apply') refreshFile(); else render(); } }, label)));
+            h('button', { className: state.tab === id ? 'active' : '', onClick: () => { state.tab = id; state.confirmClear = false; if (id !== 'setup') refreshFile(); else render(); } }, label)));
     const body = state.tab === 'setup' ? tabSetup() : state.tab === 'probe' ? tabProbe() : tabApply();
     root.replaceChildren(tabs, status, h('div', { id: 'msg' }), ...body.filter(Boolean));
     renderConn();
@@ -844,7 +1011,12 @@ async function pollProbe() {
 async function init() {
     try {
         const saved = await storage.get('settings', null);
-        if (saved && typeof saved === 'object') state.s = { ...DEFAULTS, ...saved };
+        if (saved && typeof saved === 'object') {
+        // `reference` ('first' | 'absolute') became `zeroAt`; 'first' moves to the job origin.
+        const { reference, ...rest } = saved;
+        state.s = { ...DEFAULTS, ...rest };
+        if (!ZERO_AT[state.s.zeroAt]) state.s.zeroAt = reference === 'absolute' ? 'absolute' : 'origin';
+    }
         const map = await storage.get('map', null);
         if (map && Array.isArray(map.z)) state.map = map;
     } catch (e) {
@@ -854,7 +1026,7 @@ async function init() {
     render();
     setupTips();
     installIcons();
-    if (state.tab === 'apply') refreshFile();
+    if (state.tab !== 'setup') refreshFile();
     clipOverlayAroundPanel();
     excludeOverlayFromRecording();
     drawOverlay();

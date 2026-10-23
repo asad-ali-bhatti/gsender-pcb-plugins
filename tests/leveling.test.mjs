@@ -31,7 +31,7 @@ X20 Y10
 G91 G0 Z1
 G90 G53 G0 Z-1
 M5`;
-const r = L.levelGcode(src, m, { segment: 2.5, reference: 'first' });
+const r = L.levelGcode(src, m, { segment: 2.5, zeroAt: 'scan' });
 const out = r.gcode.split('\n');
 // plunge at 0,0: offset 0 -> Z-0.1
 assert.ok(out.includes('G1 X0 Y0 Z-0.1 F100'), r.gcode);
@@ -58,4 +58,34 @@ assert.ok(fc.length > 60 && Math.abs(fc.at(-1).z + 1) < 1e-12);
 // inch file: offsets converted to inch
 const ri = L.levelGcode('G20 G90\nG0 X0 Y0 Z0\nG1 X0.3937 Y0 F10', m, { segment: 100 });
 assert.ok(ri.gcode.includes('G1 X0.3937 Y0 Z0.00394'), ri.gcode);
+// Z0 at the job origin: a map whose first probe point is the middle of the
+// grid and whose grid starts 1 mm before X0 Y0 (the margin). The cut at X0 Y0
+// keeps its programmed depth; elsewhere it follows the map relative to X0 Y0.
+const gm = { xmin: -1, xmax: 19, ymin: -1, ymax: 9, nx: 3, ny: 3 };
+const mm = L.createHeightMap(gm);
+const plane = (x, y) => 0.01 * x + 0.02 * y - 0.13;
+for (const p of L.gridPoints(gm)) mm.z[p.idx] = plane(p.x, p.y);
+mm.anchor = 4; // X9 Y4, the middle
+const job = 'G21 G90\nG0 X0 Y0\nG1 Z-0.08 F50\nG1 X10 Y0 F200';
+const zo = L.levelGcode(job, mm, { segment: 100, zeroAt: 'origin' });
+assert.ok(zo.gcode.includes('G1 X0 Y0 Z-0.08 F50'), zo.gcode);
+assert.ok(zo.gcode.includes('G1 X10 Y0 Z0.02 F200'), zo.gcode);
+assert.ok(zo.gcode.includes('Z0 at job origin'), 'header names the zero point');
+assert.deepEqual(zo.warnings, []);
+// Same map with Z0 at the first point: X0 Y0 is 0.17 mm lower than X9 Y4.
+const zs = L.levelGcode(job, mm, { segment: 100, zeroAt: 'scan' });
+assert.ok(zs.gcode.includes('G1 X0 Y0 Z-0.25 F50'), zs.gcode);
+// Default is the job origin.
+assert.equal(L.levelGcode(job, mm, { segment: 100 }).gcode, zo.gcode);
+// X0 Y0 outside the probed area: warned.
+const off = L.createHeightMap({ xmin: 5, xmax: 15, ymin: 5, ymax: 15, nx: 2, ny: 2 });
+off.z.fill(0);
+assert.ok(L.levelGcode(job, off, { segment: 100 }).warnings.some((w) => w.includes('outside the probed area')));
+// cutPaths: feed moves only, rapids split paths, arcs linearised, inches converted
+const cp = L.cutPaths('G21 G90\nG0 X0 Y0\nG1 Z-0.1\nG1 X10\nG2 X20 Y0 I5 J0\nG0 Z1\nG0 X30\nG1 X40\nG20\nG1 X2');
+assert.equal(cp.length, 2);
+assert.deepEqual(cp[0][0], [0, 0]);
+assert.deepEqual(cp[0][1], [10, 0]);
+assert.ok(cp[0].length > 5 && cp[0].some(([, y]) => y > 4.9), 'arc linearised over the top');
+assert.deepEqual(cp[1], [[30, 0], [40, 0], [50.8, 0]]);
 console.log('all tests passed');

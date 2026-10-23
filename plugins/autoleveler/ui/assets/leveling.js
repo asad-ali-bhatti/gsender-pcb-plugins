@@ -125,18 +125,58 @@ function parseWords(code) {
 
 const NON_LEVELABLE_G = new Set([4, 10, 28, 28.1, 30, 30.1, 38.2, 38.3, 38.4, 38.5, 53, 92, 92.1, 92.2, 92.3]);
 
+/** Index of the point the scan probed first (the height reference). Maps from before it was stored used point 0. */
+export const anchorIdx = (map) => (Number.isInteger(map?.anchor) ? map.anchor : 0);
+
+/** The grid point nearest the middle of the grid: on the board even when the margin isn't. */
+export function centerPoint(points) {
+    const xs = points.map((p) => p.x), ys = points.map((p) => p.y);
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+    return points.reduce((best, p) => (Math.hypot(p.x - cx, p.y - cy) < Math.hypot(best.x - cx, best.y - cy) ? p : best));
+}
+
+/**
+ * Points in the order a scan probes them: `anchor` first (it finds the copper
+ * and sets Z0), then the rest in serpentine grid order.
+ */
+export function probeOrder(points, anchor = centerPoint(points)) {
+    return [anchor, ...points.filter((p) => p.idx !== anchor.idx)];
+}
+
+/** Where work Z0 is expected on the copper when the levelled job runs. */
+export const ZERO_AT = {
+    origin: 'job origin (X0 Y0)',
+    scan: 'grid middle (first probe)',
+    absolute: 'Z0 used during the scan',
+};
+
+/**
+ * Map height (work Z at scan time) of the copper where work Z0 is set for the
+ * job: X0 Y0 (interpolated), the scan's first point, or 0 to keep the scan's Z0.
+ * `beyond` is how far X0 Y0 lies outside the probed area (its height is then
+ * taken from the nearest edge).
+ */
+export function zeroHeight(map, zeroAt) {
+    if (zeroAt === 'absolute') return { z: 0, beyond: 0 };
+    if (zeroAt === 'scan') return { z: map.z[anchorIdx(map)], beyond: 0 };
+    const h = heightAt(map, 0, 0);
+    return { z: h.z, beyond: h.beyond };
+}
+
 /**
  * Rewrites absolute-mode G0/G1/G2/G3 moves so Z follows the height map.
  * Long G1 moves are split into `segment` long pieces and XY arcs are linearised.
  *
  * @param {string} text   G-code
  * @param {object} map    complete height map (mm, work coordinates)
- * @param {object} opts   { segment (mm), reference: 'first' | 'absolute', name }
+ * @param {object} opts   { segment (mm), zeroAt: 'origin' | 'scan' | 'absolute', name }
  */
 export function levelGcode(text, map, opts = {}) {
     if (!isComplete(map)) throw new Error('Height map is incomplete');
     const segmentMm = opts.segment > 0 ? opts.segment : 1;
-    const refZ = opts.reference === 'absolute' ? 0 : map.z[0];
+    const zeroAt = ZERO_AT[opts.zeroAt] ? opts.zeroAt : 'origin';
+    const zero = zeroHeight(map, zeroAt);
+    const refZ = zero.z;
 
     const out = [];
     const warnings = new Set();
@@ -155,7 +195,8 @@ export function levelGcode(text, map, opts = {}) {
         return st.inch ? off / MM_PER_INCH : off;
     };
 
-    out.push(`(Autoleveled by gSender Autoleveler: ${map.nx}x${map.ny} grid, X${fmt(map.xmin, 3)}..${fmt(map.xmax, 3)} Y${fmt(map.ymin, 3)}..${fmt(map.ymax, 3)}, ref=${opts.reference === 'absolute' ? 'absolute' : 'first point'})`);
+    out.push(`(Autoleveled by gSender Autoleveler: ${map.nx}x${map.ny} grid, X${fmt(map.xmin, 3)}..${fmt(map.xmax, 3)} Y${fmt(map.ymin, 3)}..${fmt(map.ymax, 3)}, Z0 at ${ZERO_AT[zeroAt]})`);
+    if (zero.beyond > 0.01) warnings.add(`X0 Y0 is ${fmt(zero.beyond, 1)} mm outside the probed area, so its height is taken from the nearest edge. Probe an area that includes X0 Y0.`);
 
     const lines = String(text).split(/\r?\n/);
     for (const raw of lines) {
@@ -316,4 +357,54 @@ export function linearizeArc(start, end, cw, { I, J, R, absArc, seg }) {
         pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a), z: start.z + ((end.z - start.z) * k) / n });
     }
     return pts;
+}
+
+/**
+ * XY paths of the cutting moves (G1/G2/G3, absolute mode) in a G-code file, in
+ * mm: a list of polylines [[x, y], ...]. Rapids break a path. Used to draw the
+ * job's footprint under the probe grid; stops after `maxPoints`.
+ */
+export function cutPaths(text, { seg = 0.5, maxPoints = 200000 } = {}) {
+    const paths = [];
+    let cur = null, count = 0;
+    const st = { abs: true, absArc: false, inch: false, motion: null, x: 0, y: 0 };
+    const lines = String(text).split(/\r?\n/);
+    for (const raw of lines) {
+        if (count >= maxPoints) break;
+        const { code } = splitComment(raw);
+        if (!code.trim()) continue;
+        const { words } = parseWords(code);
+        const get = (L) => { const w = words.find((x) => x.letter === L); return w ? w.value : undefined; };
+        let special = false;
+        for (const w of words) {
+            if (w.letter !== 'G') continue;
+            const v = Math.round(w.value * 10) / 10;
+            if (v === 90) st.abs = true;
+            else if (v === 91) st.abs = false;
+            else if (v === 90.1) st.absArc = true;
+            else if (v === 91.1) st.absArc = false;
+            else if (v === 20) st.inch = true;
+            else if (v === 21) st.inch = false;
+            else if (v === 0 || v === 1 || v === 2 || v === 3) st.motion = v;
+            else if (v === 80) st.motion = null;
+            else if (NON_LEVELABLE_G.has(v)) special = true;
+        }
+        const X = get('X'), Y = get('Y');
+        if (special || (X === undefined && Y === undefined)) continue;
+        const k = st.inch ? MM_PER_INCH : 1;
+        const to = (v, prev) => (v === undefined ? prev : st.abs ? v * k : prev + v * k);
+        const nx = to(X, st.x), ny = to(Y, st.y);
+        if (st.motion === 1 || st.motion === 2 || st.motion === 3) {
+            if (!cur) { cur = [[st.x, st.y]]; paths.push(cur); count++; }
+            const I = get('I'), J = get('J'), R = get('R');
+            const arc = st.motion !== 1 && linearizeArc({ x: st.x, y: st.y, z: 0 }, { x: nx, y: ny, z: 0 }, st.motion === 2, {
+                I: I === undefined ? undefined : I * k, J: J === undefined ? undefined : J * k, R: R === undefined ? undefined : R * k, absArc: st.absArc, seg,
+            });
+            for (const p of arc || [{ x: nx, y: ny }]) { cur.push([p.x, p.y]); count++; }
+        } else {
+            cur = null;
+        }
+        st.x = nx; st.y = ny;
+    }
+    return paths;
 }
