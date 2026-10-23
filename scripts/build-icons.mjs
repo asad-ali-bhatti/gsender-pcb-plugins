@@ -68,8 +68,6 @@ const clearedTop = `<path d="${poly([P1, P2, P3, P4])}" fill="var(--ic-fr4)" str
 
 icons['b-isolation'] = slab() + isoGroove(2.2) + circuit();
 icons['b-passes'] = slab() + isoGroove(3.6) + grown(2, 'var(--ic-fr4-l)') + grown(1.7, 'var(--ic-fr4)') + circuit();
-const head = (u, v, du) => mark(line([at(u - du, v - 0.07), at(u, v), at(u - du, v + 0.07)]), 1.3);
-icons['b-direction'] = slab() + isoGroove(2.2) + circuit() + head(0.42, 0.18, 0.12) + head(0.62, 0.84, -0.12);
 icons['b-clearing'] = slab() + clearedTop + passLines + circuit();
 icons['b-drill'] = slab() + `<path d="${ellipse(0.5, 0.5, 0.09)}" fill="var(--ic-hole)"/>` + toolLine(H[0], H[1], 16);
 icons['b-millhole'] = slab() + `<path d="${ellipse(0.5, 0.5, 0.2)}" fill="var(--ic-hole)"/>`
@@ -129,13 +127,51 @@ icons['s-backoff'] = board(24, 34) + endmill(20, 6, 0, 16) + arrow(14, 20, 10) +
 const field = '<rect x="2" y="2" width="40" height="36" rx="1" fill="var(--ic-fr4)" stroke="var(--ic-edge)" stroke-width=".7"/>';
 const copper = (y, h) => `<rect x="2" y="${y}" width="40" height="${h}" fill="var(--ic-cu)"/>`
     + `<path d="M2 ${y + 0.5} H42" stroke="var(--ic-cu-hi)" stroke-width="1"/><path d="M2 ${y + h - 0.5} H42" stroke="var(--ic-cu-dk)" stroke-width="1"/>`;
-const pass = (y, w) => `<rect x="4" y="${y}" width="36" height="${w}" rx="${w / 2}" fill="none" stroke="var(--ic-line)" stroke-width=".8"/>`;
-const lap = (y, h) => `<rect x="8" y="${y}" width="28" height="${h}" fill="var(--ic-fr4-l)"/>`;
-const toolRing = (cx, cy, r) => `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--ic-line)" stroke-width=".9" stroke-dasharray="1.6 1.2"/>`;
-// Isolation: a trace above and copper below; two passes clear the gap between them and overlap.
-icons['c-isolation'] = field + copper(2, 9) + copper(29, 9) + lap(17, 3) + pass(11, 9) + pass(17, 9) + toolRing(34, 21.5, 4.5) + dimv(45, 17, 20);
-// Clearing: three passes across a wider gap, each overlapping the last.
-icons['c-clearing'] = field + copper(2, 6) + copper(32, 6) + lap(15, 2.5) + lap(22.5, 2.5) + pass(8, 9.5) + pass(15, 10) + pass(22.5, 9.5) + toolRing(34, 27.2, 4.75) + dimv(45, 15, 17.5);
+const pass = (y, w) => `<rect x="4" y="${n(y)}" width="36" height="${n(w)}" rx="${n(w / 2)}" fill="none" stroke="var(--ic-line)" stroke-width=".8"/>`;
+const lap = (y, h) => `<rect x="8" y="${n(y)}" width="28" height="${n(h)}" fill="var(--ic-line)" fill-opacity=".4"/>`;
+// The cutter seen from above: a grey disc with light flutes (also used by the milling-direction icons).
+const cutter = (cx, cy, r) => `<circle cx="${n(cx)}" cy="${n(cy)}" r="${n(r)}" fill="var(--ic-bit)" stroke="var(--ic-bit-edge)" stroke-width=".7"/>`
+    + `<path d="M${n(cx - 0.6 * r)} ${n(cy - 0.52 * r)} L${n(cx + 0.6 * r)} ${n(cy + 0.52 * r)} M${n(cx + 0.6 * r)} ${n(cy - 0.52 * r)} L${n(cx - 0.6 * r)} ${n(cy + 0.52 * r)}" stroke="var(--ic-bit-hi)" stroke-width=".8"/>`;
+// Overlapping passes filling the gap between copper above (y < top) and below (y > bot):
+// the first pass touches the upper copper, the last the lower; overlaps are lighter and the
+// first one is dimensioned. The cutter sits at the end of the last pass.
+function overlapIcon(top, bot, count, ov) {
+    const w = (bot - top + (count - 1) * ov) / count;
+    const ys = [...Array(count)].map((_, i) => top + i * (w - ov));
+    let s = field + copper(2, top - 2) + copper(bot, 38 - bot);
+    for (const y of ys.slice(1)) s += lap(y, ov);
+    for (const y of ys) s += pass(y, w);
+    return s + cutter(34, ys[count - 1] + w / 2, w / 2) + dimv(45, ys[1], ys[1] + ov);
+}
+icons['c-isolation'] = overlapIcon(11, 29, 2, 3);
+icons['c-clearing'] = overlapIcon(8, 32, 3, 2.5);
+
+// Milling direction, seen from above with the spindle turning clockwise (M3): climb on the
+// left, conventional on the right. The trace runs along the top; ahead of the cutter the copper
+// is still there, behind it the groove shows laminate. The feed arrow is the value the field
+// sets; the selected panel is drawn solid and the other faded.
+function directionPanel(ox, feed) {
+    const cx = ox + 11, cy = 16, r = 5;
+    const ahead = feed < 0 ? [ox + 1, cx] : [cx, ox + 23];
+    let s = `<rect x="${ox + 1}" y="2" width="22" height="36" rx="1" fill="var(--ic-fr4)" stroke="var(--ic-edge)" stroke-width=".7"/>`
+        + `<rect x="${ahead[0]}" y="11" width="${ahead[1] - ahead[0]}" height="10" fill="var(--ic-cu)"/>`
+        + `<rect x="${ox + 1}" y="2" width="22" height="9" fill="var(--ic-cu)"/>`
+        + `<path d="M${ox + 1} 10.5 H${ox + 23}" stroke="var(--ic-cu-dk)" stroke-width="1"/>`
+        + cutter(cx, cy, r);
+    // Clockwise rotation arrow under the cutter, from 25° round to 155°.
+    const rr = 7.6, a0 = (25 * Math.PI) / 180, a1 = (155 * Math.PI) / 180;
+    const p0 = [cx + rr * Math.cos(a0), cy + rr * Math.sin(a0)], p1 = [cx + rr * Math.cos(a1), cy + rr * Math.sin(a1)];
+    const tx = -Math.sin(a1), ty = Math.cos(a1); // direction of travel at the end
+    const hx = p1[0] - 2.2 * tx, hy = p1[1] - 2.2 * ty;
+    s += `<path d="M${n(p0[0])} ${n(p0[1])} A${rr} ${rr} 0 0 1 ${n(p1[0])} ${n(p1[1])} M${n(hx - 1.6 * ty)} ${n(hy + 1.6 * tx)} L${n(p1[0])} ${n(p1[1])} L${n(hx + 1.6 * ty)} ${n(hy - 1.6 * tx)}" fill="none" stroke="var(--ic-line)" stroke-width="1.1" ${R}/>`;
+    // Feed arrow
+    const [x0, x1] = feed < 0 ? [ox + 19, ox + 4] : [ox + 4, ox + 19];
+    s += `<path d="M${x0} 32 H${x1} M${x1 - 3 * feed} 29 L${x1} 32 L${x1 - 3 * feed} 35" fill="none" stroke="var(--ic-dim)" stroke-width="1.6" ${R}/>`;
+    return s;
+}
+const faded = (svg) => `<g opacity=".3">${svg}</g>`;
+icons['c-climb'] = directionPanel(0, -1) + faded(directionPanel(24, 1));
+icons['c-conventional'] = faded(directionPanel(0, -1)) + directionPanel(24, 1);
 
 // Tabs: top-down close-up of a board corner. The cut channel runs round the board; copper
 // bridges (tabs) keep it attached to the rest of the sheet. The tab width is dimensioned.
@@ -203,7 +239,12 @@ export function installIcons(doc = document) {
     const show = (el) => {
         if (!el.isConnected) return;
         popover.querySelector('use').setAttribute('href', \`#ic-\${el.dataset.icon}\`);
-        popover.lastChild.textContent = el.dataset.cap ?? '';
+        // First line of the caption is the title, the rest the description.
+        const [title, ...rest] = (el.dataset.cap ?? '').split('\\n');
+        const text = popover.lastChild;
+        text.textContent = '';
+        if (rest.length) text.append(Object.assign(doc.createElement('strong'), { textContent: title }), rest.join('\\n'));
+        else text.textContent = title;
         popover.style.display = 'block';
         const r = el.getBoundingClientRect();
         const w = popover.offsetWidth, ht = popover.offsetHeight;
@@ -221,7 +262,7 @@ export function installIcons(doc = document) {
     doc.addEventListener('mouseleave', () => { cur = null; hide(); });
 }
 
-/** A small icon element; \`cap\` is the one-line explanation shown with the large view. */
+/** A small icon element; \`cap\` is shown with the large view: a title line, then the description. */
 export function icon(name, cap = '', doc = document) {
     const el = doc.createElement('span');
     el.className = 'ic';

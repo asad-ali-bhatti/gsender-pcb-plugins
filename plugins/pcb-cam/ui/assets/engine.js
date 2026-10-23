@@ -1,7 +1,7 @@
 // Runs generation in a module worker so a big board doesn't freeze the page.
 // Falls back to the main thread when workers are unavailable.
 
-import { loadFile, generate, analyzeProject, suggestRegions } from '../core/index.js';
+import { loadFile, generate, generateJob, analyzeProject, suggestRegions } from '../core/index.js';
 
 export function createEngine() {
     let worker = null;
@@ -37,6 +37,7 @@ export function createEngine() {
             remove: (inputId) => call({ type: 'remove', inputId }),
             clear: () => call({ type: 'clear' }),
             generate: (project, toolChangeOption, { only, analyze = true } = {}) => call({ type: 'generate', project, toolChangeOption, only, analyze }),
+            job: (project, job, toolChangeOption) => call({ type: 'job', project, job, toolChangeOption }),
             suggest: (inputId, tool, depth, margin) => call({ type: 'suggest', inputId, tool, depth, margin }),
         };
     }
@@ -55,6 +56,10 @@ export function createEngine() {
             await new Promise((r) => setTimeout(r, 30)); // let the "Generating…" status paint
             const result = generate(project, layers, { toolChangeOption, only });
             return { result, analysis: result.ok && analyze ? analyzeProject(project, layers, { only }) : [] };
+        },
+        job: async (project, job, toolChangeOption) => {
+            await new Promise((r) => setTimeout(r, 30));
+            return generateJob({ project, jobs: [job] }, job.id, { layers, toolChangeOption });
         },
         suggest: async (inputId, tool, depth, margin) => {
             if (!layers[inputId]) throw new Error('File not loaded');

@@ -1,7 +1,7 @@
 // Generation worker: keeps its own parsed copy of every input file (sent once
 // as text) and runs generate + analysis off the page's main thread.
 
-import { loadFile, generate, analyzeProject, suggestRegions } from '../core/index.js';
+import { loadFile, generate, generateJob, analyzeProject, suggestRegions } from '../core/index.js';
 
 const layers = {};
 
@@ -23,6 +23,8 @@ function run(msg) {
             const analysis = result.ok && msg.analyze ? analyzeProject(msg.project, layers, { only: msg.only }) : [];
             return { result, analysis };
         }
+        case 'job':
+            return generateJob({ project: msg.project, jobs: [msg.job] }, msg.job.id, { layers, toolChangeOption: msg.toolChangeOption });
         case 'suggest':
             if (!layers[msg.inputId]) throw new Error('File not loaded');
             return suggestRegions(layers[msg.inputId], msg.tool, msg.depth, { margin: msg.margin });

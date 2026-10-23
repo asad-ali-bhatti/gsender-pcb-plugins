@@ -41,10 +41,10 @@ export const DEFAULT_TOOLS = [
 /** Default fields for a new operation of `type` (id, input and tool filled in by the caller). */
 export function operationDefaults(type) {
     switch (type) {
-        case 'isolation': return { type, enabled: true, depth: 0.1, passes: 2, overlap: 0.25, direction: 'climb' };
+        case 'isolation': return { type, enabled: true, depth: 0.08, passes: 2, overlap: 0.25, direction: 'climb' };
         case 'drilling': return { type, enabled: true, holes: 'all', breakthrough: 0.2, peck: 0 };
         case 'cutout': return { type, enabled: true, breakthrough: 0.2, side: 'outside', tabs: { count: 4, width: 2, height: 0.6 } };
-        case 'clearing': return { type, enabled: true, depth: 0.1, overlap: 0.4, rest: true };
+        case 'clearing': return { type, enabled: true, depth: 0.08, overlap: 0.4, rest: true };
         default: throw new Error(`Unknown operation type ${type}`);
     }
 }

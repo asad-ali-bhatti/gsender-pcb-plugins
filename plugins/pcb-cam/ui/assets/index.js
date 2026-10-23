@@ -8,13 +8,17 @@
 import { storage, gcode, getWorkspaceState } from '@sienci/gsender-plugin-sdk';
 import {
     loadFile, createProject, applyCommand, validateProject, inspectBoard, componentOf, netOf, isPlated,
-    createToolDb, setTool, removeTool, findTool, widthAtDepth, regionMask, multiDepth, drillMethod, geometry as G,
+    createToolDb, setTool, removeTool, findTool, widthAtDepth, regionMask, shapeMask, multiDepth, drillMethod, geometry as G,
+    runnableProject, gcodeHash, CORE_VERSION, PROJECT_FORMAT,
 } from '../core/index.js';
 import { DEFAULT_TOOLS, operationDefaults, standardJob, pickTool, OP_TOOL_TYPES } from './defaults.js';
 import { createEngine } from './engine.js';
 import { installIcons, icon } from './icons.js';
 import { createView, toolpathPath } from './view.js';
-import { session, savedHandle, fileApi, pickSaveFile, pickOpenFile, writePermission, writeFile, readFile } from './persist.js';
+import {
+    session, savedHandle, savedFolder, fileApi, pickSaveFile, pickOpenFile, pickFolder, writePermission, writeFile, readFile,
+    folderId, markFolder, folderFile, inFolder, createProjectFile, boardName, PROJECT_EXT,
+} from './persist.js';
 
 // gSender records sessions with PostHog when usage data collection is on, and
 // the recorder also captures same-origin plugin iframes. Opt the page out.
@@ -29,10 +33,23 @@ try {
 
 const ROLES = ['copper', 'outline', 'drill', 'other'];
 const SIDES = ['top', 'bottom', null];
-const COLORS = { 'copper-top': '#d4893f', 'copper-bottom': '#4a90e2', copper: '#c0a060', outline: '#e6c229', drill: '#f0f0f0', other: '#8b949e' };
-const OP_COLORS = ['#0ef6ae', '#ff7edb', '#5ab0ff', '#ffd166', '#c792ea', '#ff8a65', '#7ee787', '#f2cc60'];
+// FlatCAM-like plot colours: green copper, blue isolation, yellow cutout, orange drills.
+const COLORS = { 'copper-top': '#8cc63f', 'copper-bottom': '#3fb6a8', copper: '#8cc63f', outline: '#e6c229', drill: '#e8833a', other: '#8b949e' };
+const OP_COLORS = {
+    isolation: ['#6b7bff', '#4fa3ff', '#a07bff'],
+    drilling: ['#ff5c8a', '#ff8a65'],
+    cutout: ['#ffd84d', '#f2a541'],
+    clearing: ['#c792ea', '#ff7edb'],
+};
+const AREA_COLOR = '#0ef6ae';
 const OP_LABEL = { isolation: 'Isolation', drilling: 'Drilling', cutout: 'Cutout', clearing: 'Copper clearing' };
 const OP_ICON = { isolation: 'b-isolation', drilling: 'b-drill', cutout: 'b-cutout', clearing: 'b-clearing' };
+const OP_DESC = {
+    isolation: 'A V-bit cuts a narrow groove around every trace and pad, separating them from the rest of the copper. The copper outside the groove stays on the board.',
+    clearing: 'An end mill removes all copper that is not part of a trace or pad. Slower than isolation, but leaves a clean board with less risk of solder bridges.',
+    drilling: 'Cuts the holes from the drill file, either plunging straight down or milling each hole to size (see Method).',
+    cutout: 'Mills through the board along its outline, leaving small tabs so the board stays attached until you snap it out.',
+};
 const TOOL_ICON = { vbit: 't-vbit', endmill: 't-endmill', drill: 't-drill' };
 const OP_SUFFIX = { isolation: 'iso', drilling: 'drill', cutout: 'cutout', clearing: 'ncc' };
 const TOOL_LABEL = { vbit: 'V-bit', endmill: 'End mill', drill: 'Drill' };
@@ -57,7 +74,7 @@ const state = {
     regionPicker: null,  // { target, kind: 'component' | 'net' }
     drawing: null,       // { target } while drawing a rectangle region
     geo: {},             // operation id → preview { key, ok, op, transform, issues, analysis, busy }
-    hidden: {},          // 'geo:<id>' / 'job:<id>' → hidden on the plot
+    hidden: {},          // 'geo:<id>' / 'job:<id>' / 'area:<id>' → hidden on the plot
     jobs: [],            // CNC jobs: { id, name, ops, result?, key?, busy? }
     selIssue: null,
     openGroups: {},      // problem group key → expanded
@@ -67,8 +84,10 @@ const state = {
     status: null,
     exportText: null,    // { title, text } shown for copying
     toolChangeOption: null,
-    file: null,          // project file on disk: { handle, name, status: saved | dirty | saving | paused | error, error }
-    lastFileName: null,  // project file used before gSender restarted
+    folder: null,        // projects folder: { dir, id, name }
+    folderHint: null,    // projects folder to reconnect after a restart: { id, name }
+    fileHint: null,      // project file to reopen after a restart: { name, external }
+    file: null,          // project file: { handle, name, status: saved | dirty | saving | paused | error, error, external }
 };
 
 const engine = createEngine();
@@ -129,8 +148,8 @@ function uniqueId(list, base) {
 //    settings, the CNC job list, UI state, tool library.
 //  - the browser session (persist.js): board files and the G-code of jobs whose
 //    geometry was deleted. Survives leaving the page, not quitting gSender.
-//  - the project file on disk, once the project was saved to one: everything,
-//    autosaved after each change. It is what survives a restart.
+//  - the project file in the projects folder: everything, autosaved every few
+//    seconds. It is what survives a restart.
 // Toolpaths and live jobs' G-code are not stored; they are regenerated.
 // Plugin storage values are JSON strings because storage.set deep-merges
 // objects; a string replaces the old value in one message (delete-then-set
@@ -138,7 +157,7 @@ function uniqueId(list, base) {
 // ---------------------------------------------------------------------------
 
 const MAX_SETTINGS_VALUE = 256 * 1024; // characters per plugin storage key
-const KEYS = { project: 'project.json', jobs: 'jobs.json', ui: 'ui.json', tooldb: 'tooldb.json' };
+const KEYS = { project: 'project.json', jobs: 'jobs.json', ui: 'ui.json', tooldb: 'tooldb.json', folder: 'folder.json' };
 const pending = new Map(); // key → value waiting for its debounce
 let flushTimer = null;
 
@@ -176,11 +195,11 @@ const saveToolDb = () => queueSave(KEYS.tooldb, state.tooldb, 0);
 function saveJobs() {
     queueSave(KEYS.jobs, state.jobs.map(({ id, name, ops, result, frozen }) => ({ id, name, ops, hadResult: !!result, ...(frozen ? { frozen } : {}) })));
     const code = Object.fromEntries(state.jobs.filter((j) => j.frozen && j.result).map((j) => [j.id, keptResult(j.result)]));
-    if (!session.set('frozen', code) && !state.file) warnOnce('frozen', 'The G-code of jobs whose geometry was deleted is too large to keep when you leave this page. Save the project to a file (File → Save project) to keep it.');
+    if (!session.set('frozen', code) && !state.file) warnOnce('frozen', 'The G-code of jobs whose geometry was deleted is too large to keep when you leave this page. Choose a projects folder (File → Save project) to keep it.');
     markDirty();
 }
 function saveFiles() {
-    if (!session.set('files', state.texts) && !state.file) warnOnce('files', 'The board files are too large to keep when you leave this page. Save the project to a file (File → Save project) to keep them.');
+    if (!session.set('files', state.texts) && !state.file) warnOnce('files', 'The board files are too large to keep when you leave this page. Choose a projects folder (File → Save project) to keep them.');
     markDirty();
 }
 const warned = new Set();
@@ -196,18 +215,23 @@ function saveUi() {
     queueSave(KEYS.ui, {
         side: state.side, main: state.main === 'code' ? 'plot' : state.main, sel: state.sel, hidden: state.hidden, open: state.open,
         visible: Object.fromEntries(Object.entries(state.meta).map(([id, m]) => [id, m.visible])), view: view.getView(),
-        fileName: state.file?.name ?? null,
     }, 1000);
 }
 // Leaving the page: send what is still waiting.
-const leaving = () => { saveUi(); flushSaves(); if (diskTimer) writeToDisk(); };
+const leaving = () => { saveUi(); flushSaves(); if (diskDirty) writeToDisk(); };
 window.addEventListener('pagehide', leaving);
 document.addEventListener('visibilitychange', () => { if (document.hidden) leaving(); });
 
-// --- Project file on disk ---------------------------------------------------
+// --- Projects folder and project file ---------------------------------------
+// Every project is a file in the projects folder. The file is created when the
+// project gets its first content and written every AUTOSAVE_MS while something
+// changed, so quitting gSender loses at most the last few seconds. Plugin
+// storage only remembers the folder's id and name and the open file's name, so
+// the folder can be reconnected (one pick) after gSender restarts.
 
-const PROJECT_FORMAT = 'pcb-cam-project';
-let diskTimer = null;
+const AUTOSAVE_MS = 3000;
+let diskDirty = false;   // the project file is behind the workspace
+let autosaveOn = false;  // set once the restore is done: never write a half-restored project
 
 /** The whole workspace as one document: the project file's content. */
 function projectDoc() {
@@ -215,15 +239,22 @@ function projectDoc() {
     for (const f of Object.values(state.texts)) boardFiles[f.name] = f.text;
     return {
         format: PROJECT_FORMAT, version: 1, project: state.project, boardFiles,
-        jobs: state.jobs.map((j) => ({ id: j.id, name: j.name, ops: j.ops, hadResult: !!j.result, ...(j.frozen ? { frozen: j.frozen, result: keptResult(j.result) } : {}) })),
+        // gcodeHash: what the user reviewed here; Project Runner regenerates the
+        // job and refuses to run it when its G-code hashes differently.
+        jobs: state.jobs.map((j) => ({
+            id: j.id, name: j.name, ops: j.ops, hadResult: !!j.result,
+            ...(j.gcodeHash ? { gcodeHash: j.gcodeHash, coreVersion: CORE_VERSION } : {}),
+            ...(j.frozen ? { frozen: j.frozen, result: keptResult(j.result) } : {}),
+        })),
     };
 }
 
+const hasContent = () => state.project.inputs.length > 0 || state.project.operations.length > 0 || state.jobs.length > 0;
+
 function markDirty() {
     if (!state.file || state.file.status === 'paused') return;
+    diskDirty = true;
     if (state.file.status !== 'saving') setFileStatus('dirty');
-    clearTimeout(diskTimer);
-    diskTimer = setTimeout(writeToDisk, 1500);
 }
 function setFileStatus(status, error = null) {
     if (!state.file) return;
@@ -231,105 +262,288 @@ function setFileStatus(status, error = null) {
     state.file.error = error;
     renderFileState();
 }
-async function writeToDisk() {
-    clearTimeout(diskTimer);
-    diskTimer = null;
+
+let writeChain = Promise.resolve(); // writes run one at a time, in order
+/** Writes the project as it is now (captured before returning) to its file. */
+function writeToDisk() {
+    diskDirty = false;
     const f = state.file;
-    if (!f || f.status === 'paused') return;
+    if (!f || f.status === 'paused') return writeChain;
+    const text = JSON.stringify(projectDoc());
     setFileStatus('saving');
+    writeChain = writeChain.then(async () => {
+        try {
+            await writeFile(f.handle, text);
+            if (state.file === f) setFileStatus(diskDirty ? 'dirty' : 'saved');
+        } catch (e) {
+            if (f.status !== 'error') console.warn('PCB CAM: write project file', e);
+            if (state.file === f) { diskDirty = true; setFileStatus('error', e.message); } // retried by the next autosave
+        }
+    });
+    return writeChain;
+}
+
+let autosaving = false;
+async function autosave() {
+    if (!autosaveOn || autosaving) return;
+    autosaving = true;
     try {
-        await writeFile(f.handle, JSON.stringify(projectDoc()));
-        if (state.file === f && !diskTimer) setFileStatus('saved');
-    } catch (e) {
-        console.warn('PCB CAM: write project file', e);
-        if (state.file === f) setFileStatus('error', e.message);
+        if (!state.file && state.folder && hasContent()) await createFileInFolder();
+        if (diskDirty) await writeToDisk();
+    } finally {
+        autosaving = false;
     }
 }
 
-/** File → Save project (as). Must run straight from a click (file picker). */
-async function saveProjectFile({ as = false } = {}) {
-    if (!fileApi) { showExport('Project JSON', projectDoc()); return; }
+/** Gives the open project a new file in the projects folder, named after it. */
+async function createFileInFolder() {
+    const folder = state.folder;
     try {
-        let handle = !as && state.file?.handle;
-        if (!handle) {
-            handle = await pickSaveFile(`${(state.project.name || 'board').replace(/[^\w.-]+/g, '-')}.pcbcam.json`);
-            if (!handle) return;
-        } else if (await writePermission(handle, true) !== 'granted') {
-            setStatus(`gSender did not allow writing to ${handle.name}. Use File → Save project as… to pick a file.`, true);
+        const handle = await createProjectFile(folder.dir, state.project.name);
+        if (state.folder !== folder || state.file) return;
+        useFile(handle, { status: 'dirty' });
+        diskDirty = true;
+    } catch (e) {
+        console.warn('PCB CAM: create project file', e);
+        warnOnce('create', `Could not create a project file in ${folder.name}: ${e.message}. File → Save project to try again.`);
+    }
+}
+
+/**
+ * Makes `handle` the open project's file: one in the projects folder, or one
+ * opened from anywhere else (`external`), which is saved where it is.
+ */
+function useFile(handle, { status = 'saved', external = false } = {}) {
+    state.file = { handle, name: handle.name, status, error: null, external };
+    state.fileHint = null;
+    savedHandle.set(handle);
+    rememberPlace();
+    renderFileState();
+}
+
+function forgetProjectFile() {
+    diskDirty = false;
+    state.file = null;
+    state.fileHint = null;
+    savedHandle.set(null);
+    rememberPlace();
+}
+
+/** Plugin storage: which folder and project file to reconnect after a restart. */
+function rememberPlace() {
+    const f = state.folder ?? state.folderHint;
+    queueSave(KEYS.folder, {
+        folder: f ? { id: f.id, name: f.name } : null,
+        file: state.file?.name ?? null,
+        external: !!state.file?.external,
+    });
+}
+
+/** Title, text and button of the "choose / reconnect the projects folder" prompt. */
+function folderPrompt() {
+    const hint = state.folderHint;
+    const file = state.fileHint && !state.fileHint.external ? state.fileHint.name : null;
+    return hint
+        ? {
+            title: 'Reconnect your projects folder',
+            text: `gSender forgets folder access when it quits. Choose "${hint.name}" again to continue${file ? ` with ${file}` : ''}.`,
+            label: `Reconnect "${hint.name}"…`,
+        }
+        : {
+            title: 'Choose a projects folder',
+            text: 'PCB CAM keeps each new project as a file in one folder and saves it every few seconds, so your work is safe if gSender closes. Create or choose a folder, for example Documents/PCB Projects.',
+            label: 'Choose projects folder…',
+        };
+}
+
+let pendingDrop = null; // files dropped before the projects folder was chosen
+/** True when work can start (the project has a file, or a folder to get one); otherwise asks for the projects folder. */
+function folderReady() {
+    if (!fileApi || state.folder || state.file) return true;
+    const p = folderPrompt();
+    showDialog({ title: p.title, text: p.text, buttons: [[p.label, 'primary', connectFolder], ['Cancel', '', () => { pendingDrop = null; }]] });
+    return false;
+}
+
+/** Asks for the projects folder. Must run straight from a click (folder picker). */
+async function connectFolder() {
+    let dir;
+    try {
+        dir = await pickFolder();
+    } catch (e) {
+        setStatus(`Could not open the folder: ${e.message}`, true);
+        return;
+    }
+    if (!dir) return;
+    const hint = state.folderHint;
+    const file = state.fileHint && !state.fileHint.external ? state.fileHint.name : null;
+    const id = await folderId(dir);
+    if (hint && id !== hint.id) {
+        showDialog({
+            title: `This is not "${hint.name}"`,
+            text: `${dir.name} is not the projects folder you used last time${file ? `, so ${file} is not in it` : ''}. Choose "${hint.name}" again, or keep your projects in ${dir.name} from now on.`,
+            buttons: [['Choose again…', 'primary', connectFolder], [`Use ${dir.name}`, '', () => adoptFolder(dir, id)], ['Cancel', '', null]],
+        });
+        return;
+    }
+    await adoptFolder(dir, id);
+}
+
+async function adoptFolder(dir, id) {
+    try {
+        id = id ?? await markFolder(dir);
+    } catch (e) {
+        setStatus(`Cannot save files in ${dir.name} (${e.message}). Choose a folder you can write to.`, true);
+        return;
+    }
+    const hint = state.folderHint;
+    const file = state.fileHint && !state.fileHint.external ? state.fileHint.name : null;
+    state.folder = { dir, id, name: dir.name };
+    state.folderHint = null;
+    savedFolder.set(dir);
+    rememberPlace();
+    // After a restart: reopen the project that was open in the folder.
+    let reopened = false;
+    if (file && !hasContent()) {
+        const handle = await folderFile(dir, file);
+        try {
+            if (handle && importJson(handle.name, await readFile(handle))) { useFile(handle); reopened = true; }
+        } catch (e) {
+            setStatus(`Could not read ${file}: ${e.message}`, true);
+        }
+        if (!handle && hint?.id === id) setStatus(`${file} is no longer in ${dir.name}. Open a project (File → Open project) or board files to start a new one.`, true);
+    }
+    if (reopened) setStatus(`Reopened "${state.project.name}" from ${dir.name}.`);
+    else if (!state.status?.err) {
+        setStatus(state.file?.external ? `Projects folder: ${dir.name}. New projects are saved there; this one stays in ${state.file.name}.`
+            : hasContent() ? `Projects folder: ${dir.name}. This project is saved there every few seconds.`
+                : `Projects folder: ${dir.name}. Now open your board files.`);
+    }
+    render();
+    if (pendingDrop) { const files = pendingDrop; pendingDrop = null; openFiles(files); }
+}
+
+/** File → Save project: writes now; asks for the projects folder first if there is none. Must run from a click. */
+async function saveProjectFile() {
+    if (!fileApi) { showExport('Project JSON', projectDoc()); return; }
+    if (!state.file && !state.folder) await connectFolder();
+    if (!state.file && !state.folder) return;
+    if (!state.file) await createFileInFolder();
+    else if (state.file.status === 'paused' || state.file.status === 'error') {
+        if (await writePermission(state.file.handle, true) !== 'granted') {
+            setStatus(`gSender did not allow writing to ${state.file.name}.`, true);
             return;
         }
-        state.file = { handle, name: handle.name, status: 'saving', error: null };
-        savedHandle.set(handle);
-        await writeToDisk();
-        if (state.file?.status === 'saved') setStatus(`Saved to ${handle.name}. Changes are saved there automatically.`);
-        saveUi();
+        state.file.status = 'dirty';
+    }
+    if (!state.file) return;
+    await writeToDisk();
+    if (state.file?.status === 'saved') setStatus(`Saved to ${state.file.external ? '' : `${state.folder.name}/`}${state.file.name}. Changes are saved there every few seconds.`);
+}
+
+/** File → Save a copy: writes the project to a file anywhere; keeps working on the open one. */
+async function saveCopy() {
+    if (!fileApi) { showExport('Project JSON', projectDoc()); return; }
+    try {
+        const handle = await pickSaveFile(`${(state.project.name || 'board').replace(/[^\w.-]+/g, '-')}${PROJECT_EXT}`, state.folder?.dir);
+        if (!handle) return;
+        await writeFile(handle, JSON.stringify(projectDoc()));
+        setStatus(`Saved a copy as ${handle.name}. You are still working on ${state.file?.name ?? `"${state.project.name}"`}.`);
     } catch (e) {
         console.error(e);
-        setStatus(`Could not save the project file: ${e.message}. File → Export project JSON shows it for copying.`, true);
+        setStatus(`Could not save the copy: ${e.message}`, true);
     }
 }
 
-/** File → Open project. Must run straight from a click (file picker). */
+/**
+ * File → Open project. The project is saved back to the file it came from,
+ * wherever that is. Must run straight from a click (file picker).
+ */
 async function openProjectFile() {
     if (!fileApi) { openPicker('.json,application/json'); return; }
     try {
-        const handle = await pickOpenFile();
-        if (!handle) return;
-        const text = await readFile(handle);
-        if (!importJson(handle.name, text)) return;
-        const perm = await writePermission(handle, true);
-        state.file = { handle, name: handle.name, status: perm === 'granted' ? 'saved' : 'paused', error: null };
-        savedHandle.set(handle);
-        saveUi();
-        renderFileState();
+        const picked = await pickOpenFile(state.folder?.dir);
+        if (!picked) return;
+        const text = await readFile(picked);
+        const inside = state.folder && await inFolder(state.folder.dir, picked);
+        // Inside the folder, use its handle: the folder's write access covers it.
+        const handle = inside ? await folderFile(state.folder.dir, picked.name) ?? picked : picked;
+        const perm = inside ? 'granted' : await writePermission(handle, true);
+        if (!importJson(picked.name, text)) return;
+        useFile(handle, { status: perm === 'granted' ? 'saved' : 'paused', external: !inside });
+        setStatus(perm === 'granted'
+            ? `Opened "${state.project.name}". Changes are saved to ${handle.name} every few seconds.`
+            : `Opened "${state.project.name}", but gSender may not write to ${handle.name}. File → Save project to allow it.`, perm !== 'granted');
     } catch (e) {
         console.error(e);
         setStatus(`Could not open the project file: ${e.message}`, true);
     }
 }
 
-function forgetProjectFile() {
-    clearTimeout(diskTimer);
-    diskTimer = null;
-    state.file = null;
-    savedHandle.set(null);
-}
-
 // --- Restore ----------------------------------------------------------------
+// Leaving the CAM page and coming back restores the workspace from plugin
+// storage and the browser session. After gSender restarts the session is gone,
+// so the workspace starts empty until the projects folder is reconnected and
+// the last project is read back from its file: never a half-restored project.
 
 let restoredUi = null;
 async function restore() {
+    const inSession = session.get('alive') === true;
     let frozen = session.get('frozen') ?? {};
+    let hint = null;
     try {
         const db = await readStored(KEYS.tooldb, 'tooldb');
         if (db && Array.isArray(db.tools)) state.tooldb = db;
-        const p = await readStored(KEYS.project, 'project');
-        if (p && p.version === 1) {
-            const issues = validateProject(p).filter((i) => i.code === 'schema');
-            if (!issues.length) state.project = p;
+        hint = await readStored(KEYS.folder);
+        if (inSession || !fileApi) {
+            const p = await readStored(KEYS.project, 'project');
+            if (p && p.version === 1) {
+                const issues = validateProject(p).filter((i) => i.code === 'schema');
+                if (!issues.length) state.project = p;
+            }
+            attachKeptFiles(session.get('files') ?? {});
+            const jobs = await readStored(KEYS.jobs, 'jobs');
+            if (Array.isArray(jobs)) state.jobs = restoreJobs(jobs, (j) => frozen[j.id]);
+        } else {
+            // Last session's project; its file is read back on reconnect.
+            state.project = createProject('Board');
+            queueSave(KEYS.project, state.project);
+            queueSave(KEYS.jobs, []);
         }
-        // Board files were kept in plugin storage for a short while; move them out.
-        const oldFiles = await storage.get('files.json', null);
-        if (oldFiles !== null) {
-            storage.delete('files.json').catch(() => {});
-            if (!session.get('files') && typeof oldFiles === 'string') { try { session.set('files', JSON.parse(oldFiles)); } catch { /* drop */ } }
-        }
-        attachKeptFiles(session.get('files') ?? {});
-        const jobs = await readStored(KEYS.jobs, 'jobs');
-        if (Array.isArray(jobs)) state.jobs = restoreJobs(jobs, (j) => frozen[j.id]);
+        if (await storage.get('files.json', null) !== null) storage.delete('files.json').catch(() => {}); // board files were briefly kept here
         restoredUi = await readStored(KEYS.ui);
     } catch (e) {
         state.status = { err: true, text: `Storage unavailable: ${e.message}` };
     }
-    // The project file, when one is open in this gSender session, fills in what
-    // the session couldn't keep.
+    session.set('alive', true);
+    try {
+        const ws = await getWorkspaceState();
+        state.toolChangeOption = ws?.toolChangeOption ?? null;
+        applyTheme(ws);
+    } catch { /* outside gSender */ }
+    if (!fileApi) return;
+    // { folder: { id, name }, file, external }; first builds stored { id, name, file }.
+    const place = hint?.id ? { folder: hint, file: hint.file } : hint ?? {};
+    const f = place.folder;
+    state.folderHint = f && typeof f.id === 'string' && typeof f.name === 'string' ? { id: f.id, name: f.name } : null;
+    state.fileHint = typeof place.file === 'string' ? { name: place.file, external: !!place.external } : null;
+    if (!inSession) return;
+    // Within one gSender session the folder and file are still known and allowed.
+    const dir = await savedFolder.get();
+    if (dir && state.folderHint && await writePermission(dir) === 'granted' && await folderId(dir) === state.folderHint.id) {
+        state.folder = { dir, id: state.folderHint.id, name: dir.name };
+        state.folderHint = null;
+    }
     const handle = await savedHandle.get();
-    if (handle && fileApi) {
-        const perm = await writePermission(handle);
-        state.file = { handle, name: handle.name, status: perm === 'granted' ? 'saved' : 'paused', error: null };
+    const inside = handle && state.folder && await inFolder(state.folder.dir, handle);
+    const perm = handle && (inside ? 'granted' : await writePermission(handle));
+    if (handle && perm !== 'denied') {
+        state.file = { handle, name: handle.name, status: perm === 'granted' ? 'saved' : 'paused', error: null, external: !inside };
+        state.fileHint = null;
+        // The project file fills in what the session couldn't keep.
         const needFiles = state.project.inputs.some((i) => !state.layers[i.id]);
         const needCode = state.jobs.some((j) => j.frozen && !j.result);
-        if (perm !== 'denied' && (needFiles || needCode)) {
+        if (needFiles || needCode) {
             try {
                 const doc = JSON.parse(await readFile(handle));
                 if (doc?.format === PROJECT_FORMAT) {
@@ -343,11 +557,6 @@ async function restore() {
             }
         }
     }
-    try {
-        const ws = await getWorkspaceState();
-        state.toolChangeOption = ws?.toolChangeOption ?? null;
-        applyTheme(ws);
-    } catch { /* outside gSender */ }
 }
 
 /** Attaches kept board files ({ inputId: { name, text } }) to inputs still missing them. */
@@ -379,7 +588,6 @@ function applyRestoredUi() {
     if (u.hidden && typeof u.hidden === 'object') state.hidden = u.hidden;
     if (u.open && typeof u.open === 'object') state.open = u.open;
     for (const [id, v] of Object.entries(u.visible ?? {})) if (state.meta[id]) state.meta[id].visible = v !== false;
-    state.lastFileName = typeof u.fileName === 'string' ? u.fileName : null;
     return !!u.view && view.setView(u.view);
 }
 
@@ -415,15 +623,19 @@ function dropFromSelection(kind, id) {
 function deleteSelected() {
     if (!state.sel.length) { setStatus('Select an object in the Project tab first.'); return; }
     const sel = [...state.sel];
-    const order = { job: 0, geo: 1, input: 2 };
+    const order = { job: 0, geo: 1, region: 2, input: 3 };
     sel.sort((a, b) => order[a.kind] - order[b.kind]);
     const done = [];
+    const freed = [];
     for (const s of sel) {
         if (s.kind === 'job') { removeJob(s.id); done.push(s.id); }
         else if (s.kind === 'geo') { if (removeOperation(s.id)) done.push(s.id); }
+        else if (s.kind === 'region') { const f = removeRegion(s.id); if (f) { done.push(s.id); freed.push(...f); } }
         else if (removeInput(s.id)) done.push(s.id);
     }
-    if (done.length === sel.length) setStatus(`Deleted ${done.length} object${done.length > 1 ? 's' : ''}.`);
+    if (done.length === sel.length) {
+        setStatus(`Deleted ${done.length} object${done.length > 1 ? 's' : ''}.${freed.length ? ` ${freed.join(', ')} now cover${freed.length === 1 ? 's' : ''} the whole layer.` : ''}`);
+    }
     render();
     updateScene();
 }
@@ -437,6 +649,7 @@ async function openFiles(files) {
     if (!files.length) return;
     let n = 0;
     let added = null;
+    let first = null; // first board file opened
     for (const file of files) {
         n++;
         setStatus(`Reading ${file.name} (${n}/${files.length})…`);
@@ -466,13 +679,19 @@ async function openFiles(files) {
             }
             attachFile(id, file.name, text, loaded);
             added = id;
+            first = first ?? file.name;
         } catch (e) {
             setStatus(`${file.name}: ${e.message}`, true);
             console.error(e);
             return;
         }
     }
-    if (added) saveFiles();
+    if (added) {
+        saveFiles();
+        // A new project takes the board's name (its file is named after it).
+        const name = boardName(first);
+        if (!state.file && state.project.name === 'Board' && name) command('project.rename', { name }, { quiet: true });
+    }
     const rejected = state.rejected.length;
     if (added) setStatus(`Opened ${n - rejected} file(s). Double-click a Gerber or Excellon object to make geometry from it.`);
     else if (rejected) setStatus('No Gerber or Excellon file found; see "Not loaded" in the Project tab.', true);
@@ -585,10 +804,12 @@ function newProject() {
 
 /**
  * Runs `action` (which replaces the open project) once the project is safe: a
- * project saved to a file gets its last changes written there first; one that
- * isn't asks to save or discard. (The plugin iframe can't show confirm().)
+ * project in the projects folder gets its last changes written there first;
+ * one that can't be saved asks to save or discard. (The plugin iframe can't
+ * show confirm().)
  */
-function whenProjectSafe(action) {
+async function whenProjectSafe(action) {
+    if (state.folder && !state.file && hasContent()) await createFileInFolder();
     const f = state.file;
     if (f && (f.status === 'saved' || f.status === 'dirty' || f.status === 'saving')) {
         if (f.status !== 'saved') writeToDisk(); // captures the project before `action` replaces it
@@ -596,14 +817,14 @@ function whenProjectSafe(action) {
         return;
     }
     const p = state.project;
-    if (!p.inputs.length && !p.operations.length && !state.jobs.length) { action(); return; }
+    if (!hasContent()) { action(); return; }
     showDialog({
         title: `Close "${p.name}"?`,
         text: f
             ? `Its latest changes could not be saved to ${f.name}. Closing discards them.`
-            : 'This project is not saved to a file. Closing discards it.',
+            : 'This project is not saved: there is no projects folder yet. Closing discards it.',
         buttons: [
-            ['Save project…', 'primary', async () => { await saveProjectFile({ as: !f }); if (state.file?.status === 'saved') action(); }],
+            [f ? 'Save project' : 'Choose projects folder…', 'primary', async () => { await saveProjectFile(); if (state.file?.status === 'saved') action(); }],
             ['Discard', 'danger', action],
             ['Cancel', '', null],
         ],
@@ -737,7 +958,13 @@ function toolSummary(t) {
 // ---------------------------------------------------------------------------
 
 const opOf = (id) => state.project.operations.find((o) => o.id === id);
-const opColor = (id) => OP_COLORS[Math.max(0, state.project.operations.findIndex((o) => o.id === id)) % OP_COLORS.length];
+/** Colour by operation type; further operations of the same type take the next shade. */
+function opColor(id) {
+    const op = opOf(id);
+    const shades = OP_COLORS[op?.type] ?? OP_COLORS.isolation;
+    const n = state.project.operations.filter((o) => o.type === op?.type).findIndex((o) => o.id === id);
+    return shades[Math.max(0, n) % shades.length];
+}
 
 function opName(op) {
     if (op.name) return op.name;
@@ -838,13 +1065,7 @@ function setupStandardJob() {
 // soon as it or anything it depends on changes.
 
 /** The project as the engine should see it: only loaded inputs and the operations that use them. */
-function runnable(p) {
-    const loaded = (id) => !!state.layers[id] && !state.layers[id].issues.some((i) => i.severity === 'error');
-    const operations = p.operations.filter((o) => loaded(o.input)).map((o) => (o.enabled ? o : { ...o, enabled: true }));
-    const used = new Set(operations.map((o) => o.input));
-    const inputs = p.inputs.filter((i) => loaded(i.id) && (used.has(i.id) || i.role === 'outline'));
-    return { ...p, inputs, operations };
-}
+const runnable = (p) => runnableProject(p, state.layers);
 
 function geoKey(op) {
     const p = state.project;
@@ -983,11 +1204,40 @@ function cancelDraw() {
     setStatus(null);
 }
 
+const regionOf = (id) => state.project.regions.find((r) => r.id === id);
+
+/**
+ * Deletes an area. Geometries and forms limited to it go back to the whole layer.
+ * @returns {string[]|null} names of the geometries that changed, or null when it failed
+ */
 function removeRegion(id) {
-    if (!command('region.remove', { id })) return;
+    const users = state.project.operations.filter((o) => o.region === id);
+    for (const op of users) updateOperation(op.id, { region: null });
     for (const d of Object.values(state.drafts)) if (d.region === id) d.region = null;
+    if (!command('region.remove', { id })) return null;
+    dropFromSelection('region', id);
+    delete state.hidden[`area:${id}`];
     render();
     updateScene();
+    return users.map(opName);
+}
+
+/** The area whose outline is within `tol` mm of `p`, drawn ones first. */
+function regionAt(p, tol) {
+    const near = (pts) => pts.some((a, i) => {
+        const b = pts[(i + 1) % pts.length];
+        const dx = b[0] - a[0], dy = b[1] - a[1];
+        const t = Math.max(0, Math.min(1, ((p.x - a[0]) * dx + (p.y - a[1]) * dy) / (dx * dx + dy * dy || 1)));
+        return Math.hypot(p.x - a[0] - t * dx, p.y - a[1] - t * dy) <= tol;
+    });
+    for (const r of state.project.regions) {
+        if (state.hidden[`area:${r.id}`] && !isSel('region', r.id)) continue;
+        const sh = r.shape;
+        const pts = sh.kind === 'rect' ? [[sh.rect[0], sh.rect[1]], [sh.rect[2], sh.rect[1]], [sh.rect[2], sh.rect[3]], [sh.rect[0], sh.rect[3]]]
+            : sh.kind === 'polygon' ? sh.points : null;
+        if (pts && near(pts)) return r.id;
+    }
+    return null;
 }
 
 function regionLabel(r) {
@@ -1034,10 +1284,14 @@ async function runJob(job) {
     try {
         try { state.toolChangeOption = (await getWorkspaceState())?.toolChangeOption ?? state.toolChangeOption; } catch { /* keep */ }
         const t0 = performance.now();
-        // G-code files are named after the project; use the job's name.
-        const { result } = await engine.generate(runnable({ ...state.project, name: job.name }), state.toolChangeOption, { only: job.ops, analyze: false });
+        const result = await engine.job(state.project, { id: job.id, name: job.name, ops: job.ops }, state.toolChangeOption);
         job.result = result;
         job.key = key;
+        // Only Project Runner reads the hash; a job must never fail over it.
+        job.gcodeHash = null;
+        if (result.ok) {
+            try { job.gcodeHash = await gcodeHash(result.files); } catch (e) { console.warn('PCB CAM: gcodeHash', e); }
+        }
         saveJobs();
         const secs = ((performance.now() - t0) / 1000).toFixed(1);
         if (result.ok && result.files?.some((f) => f.name === state.loaded)) state.loaded = null; // regenerated: not what gSender has
@@ -1160,7 +1414,9 @@ const statusText = h('span', { className: 'msg' });
 const coords = h('span', { className: 'coords' }, '');
 statusBar.append(statusText, coords);
 const fileInput = h('input', { type: 'file', multiple: true, style: 'display:none', onChange: (e) => { openFiles(e.target.files); e.target.value = ''; } });
-const openPicker = (accept = '') => { fileInput.accept = accept; fileInput.click(); };
+const pickFiles = (accept = '') => { fileInput.accept = accept; fileInput.click(); };
+/** Opens board files (or a project): needs the projects folder first. */
+const openPicker = (accept = '') => { if (folderReady()) pickFiles(accept); };
 const GERBER_EXT = '.gbr,.ger,.gtl,.gbl,.gto,.gbo,.gts,.gbs,.gtp,.gbp,.gm1,.gko,.gml,.gm,.pho,.art,.cmp,.sol,.g1,.g2';
 const EXCELLON_EXT = '.drl,.xln,.txt,.nc,.tap,.exc,.drd';
 
@@ -1186,13 +1442,14 @@ function menuItems(id) {
             ['New project', () => whenProjectSafe(newProject)],
             ['Open project…', () => whenProjectSafe(openProjectFile)],
             ['Save project  (⌘S)', () => saveProjectFile()],
-            ['Save project as…', () => saveProjectFile({ as: true })],
-            ['Close project', closeProject, !state.project.inputs.length && !state.project.operations.length && !state.jobs.length && !state.file],
+            ['Save a copy as…  (⇧⌘S)', saveCopy],
+            ...(fileApi ? [[state.folder ? `Change projects folder (${state.folder.name})…` : folderPrompt().label, connectFolder]] : []),
+            ['Close project', closeProject, !hasContent() && !state.file],
             null,
             ['Open Gerber…', () => openPicker(GERBER_EXT)],
             ['Open Excellon…', () => openPicker(EXCELLON_EXT)],
             ['Open all board files…', () => openPicker('')],
-            ['Open tool library (.json)…', () => openPicker('.json,application/json')],
+            ['Open tool library (.json)…', () => pickFiles('.json,application/json')],
             null,
             ['Export project JSON (copy)', () => showExport('Project JSON', projectDoc())],
             ['Export tool library JSON', () => showExport('Tool library JSON', state.tooldb)],
@@ -1236,15 +1493,19 @@ const fileState = h('span', { className: 'filestate' });
 function renderFileState() {
     const f = state.file;
     const [text, cls, title] = !f
-        ? ['Not saved to a file', 'warn', 'Kept until gSender quits. File → Save project keeps it in a file.']
-        : f.status === 'saved' ? [`Saved · ${f.name}`, '', 'Changes are saved to this file automatically.']
+        ? (!fileApi ? ['Not saved to a file', 'warn', 'Kept until gSender quits. File → Export project JSON keeps a copy.']
+            : state.fileHint?.external ? [`Reopen · ${state.fileHint.name}`, 'warn', 'gSender forgets file access when it quits: open the project again.']
+                : !state.folder ? [state.folderHint ? `Reconnect · ${state.folderHint.name}` : 'No projects folder', 'warn', folderPrompt().text]
+                : [`Projects folder · ${state.folder.name}`, '', 'The project gets its file there as soon as it has content.'])
+        : f.status === 'saved' ? [`Saved · ${f.name}`, '', `Saved every few seconds to ${f.external ? `${f.name}, where you opened it` : `${state.folder?.name}/${f.name}`}.`]
             : f.status === 'dirty' || f.status === 'saving' ? [`Saving · ${f.name}`, '', '']
                 : f.status === 'paused' ? [`Not saving · ${f.name}`, 'warn', 'gSender needs your OK to write this file again: File → Save project.']
                     : [`Save failed · ${f.name}`, 'err', f.error ?? ''];
     fileState.textContent = text;
     fileState.className = `filestate ${cls}`;
     fileState.title = title;
-    fileState.onclick = f && f.status === 'saved' ? null : () => saveProjectFile();
+    fileState.onclick = f ? (f.status === 'saved' ? null : () => saveProjectFile())
+        : !fileApi ? null : state.fileHint?.external ? openProjectFile : !state.folder ? connectFolder : null;
 }
 
 function renderHeader() {
@@ -1317,10 +1578,10 @@ function renderExport() {
 
 const collapsed = (key, dflt = true) => !(state.open[key] ?? dflt);
 
-function section(key, title, content, { open: dflt = true, extra } = {}) {
+function section(key, title, content, { open: dflt = true, extra, ic, desc } = {}) {
     const open = !collapsed(key, dflt);
     return h('div', { className: `section fold${open ? ' open' : ''}` },
-        h('h4', { className: 'foldhead', onClick: () => { state.open[key] = !open; renderSide(); updateScene(); } }, h('span', {}, `${open ? '▾' : '▸'} ${title}`), extra ?? null),
+        h('h4', { className: 'foldhead', onClick: () => { state.open[key] = !open; renderSide(); updateScene(); } }, h('span', { className: ic ? 'lt' : '' }, `${open ? '▾' : '▸'} `, ic ? icon(ic, desc ? `${title}\n${desc}` : title) : null, title), extra ?? null),
         open ? content : null);
 }
 
@@ -1342,11 +1603,19 @@ function tabProject() {
         h('input', { type: 'checkbox', checked: visible, disabled: missing, title: 'Show on the plot', onChange: (e) => { onVisible(e.target.checked); saveUi(); } })),
     h('span', { className: 'swatch', style: `background:${color}` }),
     h('span', { className: 'name' }, label),
-    info ? h('span', { className: 'info' }, info) : null);
-    const group = (key, title, items) => {
+    info ? h('span', { className: 'info' }, info) : null,
+    h('button', {
+        className: 'rm', title: 'Delete', 'aria-label': `Delete ${label}`,
+        onClick: (e) => { e.stopPropagation(); state.sel = [{ kind, id }]; deleteSelected(); },
+        onDblClick: (e) => e.stopPropagation(),
+    }, '×'));
+    const group = (key, title, items, add) => {
         const open = !collapsed(`g:${key}`);
         return h('div', { className: 'tgroup' },
-            h('div', { className: 'thead', onClick: () => { state.open[`g:${key}`] = !open; renderSide(); } }, `${open ? '▾' : '▸'} ${title}`, h('span', { className: 'count' }, items.length)),
+            h('div', { className: 'thead', onClick: () => { state.open[`g:${key}`] = !open; renderSide(); } },
+                h('span', { className: 'tt' }, `${open ? '▾' : '▸'} ${title}`),
+                add ? h('button', { className: 'add', title: add.tip, onClick: (e) => { e.stopPropagation(); add.run(); } }, '+ Add') : null,
+                h('span', { className: 'count' }, items.length)),
             open ? items : null);
     };
     const inputItem = (i) => {
@@ -1374,7 +1643,33 @@ function tabProject() {
         color: '#ffffff', visible: !state.hidden[`job:${j.id}`],
         onVisible: (v) => { state.hidden[`job:${j.id}`] = !v; updateScene(); },
     });
+    const regionItem = (r) => {
+        const n = p.operations.filter((o) => o.region === r.id).length;
+        return item('region', r.id, {
+            label: regionLabel(r),
+            info: n ? `${n} geometr${n === 1 ? 'y' : 'ies'}` : 'unused',
+            color: AREA_COLOR, visible: !state.hidden[`area:${r.id}`],
+            onVisible: (v) => { state.hidden[`area:${r.id}`] = !v; updateScene(); },
+        });
+    };
     const empty = !p.inputs.length;
+    if (fileApi && !state.folder && !state.file) {
+        const fp = folderPrompt();
+        const ext = state.fileHint?.external ? state.fileHint.name : null;
+        return [ext
+            ? h('div', { className: 'section card' },
+                h('b', {}, 'Reopen your project'),
+                h('p', {}, `gSender forgets file access when it quits. Open ${ext} again to continue; it is saved where it is.`),
+                h('div', { className: 'row' },
+                    h('button', { className: 'b primary', onClick: openProjectFile }, `Open ${ext}…`),
+                    h('button', { className: 'b', onClick: connectFolder }, fp.label)))
+            : h('div', { className: 'section card' },
+                h('b', {}, fp.title),
+                h('p', {}, fp.text),
+                h('div', { className: 'row' },
+                    h('button', { className: 'b primary', onClick: connectFolder }, fp.label),
+                    h('button', { className: 'b', onClick: openProjectFile }, 'Open a project file…')))];
+    }
     return [
         empty ? h('div', { className: 'section card' },
             h('b', {}, 'Workflow'),
@@ -1388,10 +1683,11 @@ function tabProject() {
             h('div', { className: 'note' }, 'Select all of a board\'s files at once, or drop them on the plot. A saved project (.json) opens the same way.'),
         ) : null,
         h('div', { className: 'tree' },
-            group('gerber', 'Gerber', gerbers.map(inputItem)),
-            group('excellon', 'Excellon', drills.map(inputItem)),
+            group('gerber', 'Gerber', gerbers.map(inputItem), { tip: 'Open Gerber files', run: () => openPicker(GERBER_EXT) }),
+            group('excellon', 'Excellon', drills.map(inputItem), { tip: 'Open drill files', run: () => openPicker(EXCELLON_EXT) }),
             group('geometry', 'Geometry', p.operations.map(geoItem)),
-            group('cnc', 'CNC Job', state.jobs.map(jobItem))),
+            group('cnc', 'CNC Job', state.jobs.map(jobItem)),
+            p.regions.length ? group('areas', 'Areas', p.regions.map(regionItem)) : null),
         !empty ? h('div', { className: 'note' }, 'Double-click an object to edit it in the Selected tab. Cmd/Ctrl-click selects several.') : null,
         state.rejected.length ? h('div', { className: 'section' },
             h('h4', {}, 'Not loaded', h('button', { className: 'link', onClick: () => { state.rejected = []; renderSide(); } }, 'clear')),
@@ -1419,7 +1715,23 @@ function tabSelected() {
         return input.role === 'drill' ? selectedExcellon(input) : selectedGerber(input);
     }
     if (s.kind === 'geo') return opOf(s.id) ? selectedGeometry(opOf(s.id)) : [];
+    if (s.kind === 'region') return regionOf(s.id) ? selectedRegion(regionOf(s.id)) : [];
     return jobOf(s.id) ? selectedJob(jobOf(s.id)) : [];
+}
+
+function selectedRegion(r) {
+    const users = state.project.operations.filter((o) => o.region === r.id);
+    const rect = r.shape.kind === 'rect' ? r.shape.rect : null;
+    return [
+        objHeader('Area', r.name ?? 'Area', AREA_COLOR),
+        h('div', { className: 'section' },
+            h('div', { className: 'kv' },
+                h('span', {}, 'Shape'), h('span', {}, regionLabel(r)),
+                rect ? h('span', {}, 'Size') : null, rect ? h('span', {}, `${fmt(rect[2] - rect[0], 2)} × ${fmt(rect[3] - rect[1], 2)} mm`) : null,
+                h('span', {}, 'Used by'), h('span', {}, users.map(opName).join(', ') || 'nothing')),
+            h('div', { className: 'note' }, users.length ? 'Deleting it makes these geometries cover the whole layer again.' : 'No geometry is limited to this area.'),
+            h('div', { className: 'row' }, h('button', { className: 'b danger small', onClick: () => deleteSelected() }, 'Delete area'))),
+    ];
 }
 
 function objHeader(kind, name, color) {
@@ -1427,7 +1739,7 @@ function objHeader(kind, name, color) {
 }
 
 /** Field label text with its icon; hovering the icon shows it large with `cap`. */
-const lab = (text, ic, cap) => (ic ? h('span', { className: 'lt' }, icon(ic, cap ?? ''), text) : text);
+const lab = (text, ic, cap) => (ic ? h('span', { className: 'lt' }, icon(ic, cap ? `${text}\n${cap}` : text), text) : text);
 const sel = (label, value, options, onChange, tip, ic) => h('label', { className: 'f', title: tip ?? '' }, lab(label, ic, tip),
     h('select', { onChange: (e) => onChange(e.target.value) }, options.map(([v, l]) => h('option', { value: v, selected: v === value }, l))));
 
@@ -1485,8 +1797,19 @@ function selectedGerber(input) {
     } else if (layer) {
         out.push(h('div', { className: 'note' }, 'Set Layer to copper (isolation, clearing) or outline (board cutout) to make geometry from this file.'));
     }
-    out.push(derivedList(input));
+    out.push(derivedList(input), deleteFileRow(input));
     return out;
+}
+
+/** "Delete file" for a Gerber or Excellon object; blocked while geometries use it. */
+function deleteFileRow(input) {
+    const users = state.project.operations.filter((o) => o.input === input.id);
+    return h('div', { className: 'section' },
+        h('div', { className: 'row' }, h('button', {
+            className: 'b danger small', disabled: users.length > 0,
+            onClick: () => { state.sel = [{ kind: 'input', id: input.id }]; deleteSelected(); },
+        }, 'Delete file')),
+        users.length ? h('div', { className: 'note' }, `Used by ${users.map(opName).join(', ')}; delete those geometries first.`) : null);
 }
 
 function selectedExcellon(input) {
@@ -1500,6 +1823,7 @@ function selectedExcellon(input) {
         layer ? toolTable(layer) : null,
         layer ? geometryForm(input, 'drilling', 'Drilling', 'Generate Drill Geometry', true) : null,
         derivedList(input),
+        deleteFileRow(input),
     ];
 }
 
@@ -1562,8 +1886,8 @@ function geometryForm(input, type, title, button, open) {
     return section(`form:${type}`, title, [
         h('div', { className: 'grid2' }, ...opFields(d, set, { type, target: { draft: key }, input })),
         state.regionPicker?.target.draft === key ? renderRegionPicker(state.regionPicker.target) : null,
-        h('div', { className: 'row' }, h('button', { className: 'b primary withic', onClick: () => createGeometry(input.id, type) }, icon(OP_ICON[type]), button)),
-    ], { open });
+        h('div', { className: 'row' }, h('button', { className: 'b primary', onClick: () => createGeometry(input.id, type) }, button)),
+    ], { open, ic: OP_ICON[type], desc: OP_DESC[type] });
 }
 
 /** Fields shared by geometry forms and geometry objects. */
@@ -1596,10 +1920,12 @@ function opFields(op, set, { type, target }) {
     if (type === 'isolation') {
         const w = tool ? widthAtDepth(tool, op.depth) : null;
         specific = [
-            numF('Cut Z (depth), mm', 'depth', { icon: 's-cutdepth', tip: 'Below the copper surface. 0.08–0.12 cuts through 35 µm copper with margin for an uneven board' }),
+            numF('Cut Z (depth), mm', 'depth', { icon: 's-cutdepth', tip: 'Below the copper surface (Z0). 0.08 cuts through 35 µm copper with margin; a V-bit cuts wider the deeper it goes, so only go deeper on an uneven, unlevelled board' }),
             numF('Passes', 'passes', { step: 1, int: true, icon: 'b-passes', tip: 'More passes = wider isolation gap' }),
             numF('Overlap (0–0.9)', 'overlap', { icon: 'c-isolation', tip: 'Fraction of the cut width each pass overlaps the previous one' }),
-            sel('Milling type', op.direction, [['climb', 'Climb'], ['conventional', 'Conventional']], (v) => set({ direction: v }), 'Climb keeps the copper on the cutter\'s right; cleaner edges on most machines', 'b-direction'),
+            sel('Milling type', op.direction, [['climb', 'Climb'], ['conventional', 'Conventional']], (v) => set({ direction: v }),
+                'Seen from above, spindle turning clockwise (M3).\nClimb (left): the cutter travels with the trace on its right, so each tooth bites in at full thickness and leaves cleanly. Sharper copper edges, fewer burrs; the usual choice for PCBs.\nConventional (right): the cutter travels the other way; each tooth starts thin and rubs before it cuts. More burrs, but gentler on a machine with backlash or a loose spindle.',
+                op.direction === 'conventional' ? 'c-conventional' : 'c-climb'),
             area, faceSel,
             h('div', { className: 'note span2' }, `Cut width at this depth: ${fmt(w, 3)} mm${op.passes > 1 && w ? `; isolation gap ≈ ${fmt(w + (op.passes - 1) * w * (1 - op.overlap), 3)} mm` : ''}.`),
         ];
@@ -2005,7 +2331,10 @@ const viewHost = h('div', { className: 'canvas' });
 plotPane.append(viewHost, pickBox, empty);
 
 const view = createView(viewHost, {
-    onClick: (p) => identify(p),
+    onClick: (p) => {
+        const r = regionAt(p, 6 * view.pxSize());
+        if (r) { selectObj('region', r, { show: true }); setStatus('Area selected. Press Delete to remove it.'); } else identify(p);
+    },
     onRect: (rect) => finishDrawRegion(rect),
     onMove: (p) => { coords.textContent = `X ${fmt(p.x, 3)}  Y ${fmt(p.y, 3)} mm`; },
 });
@@ -2045,7 +2374,7 @@ function updateScene({ fit = false } = {}) {
         if (!j.result?.ok || state.hidden[`job:${j.id}`]) continue;
         for (const op of j.result.operations ?? []) {
             const tool = toolOf(op.tool);
-            toolpaths.push({ path: pathOf(op, j.result.transform), color: opColor(op.id), visible: true, width: op.stats.width ?? tool?.diameter ?? 0, diameter: tool?.diameter ?? 0.8 });
+            toolpaths.push({ path: pathOf(op, j.result.transform), color: opColor(op.id), visible: true, travel: true, width: op.stats.width ?? tool?.diameter ?? 0, diameter: tool?.diameter ?? 0.8 });
         }
     }
 
@@ -2065,8 +2394,20 @@ function updateScene({ fit = false } = {}) {
     if (target?.region && Object.keys(state.layers).length) {
         try {
             const mask = regionMask(p, target, state.layers);
-            if (mask?.length) regions.push({ shape: mask, color: '#0ef6ae', active: true });
+            if (mask?.length) regions.push({ shape: mask, color: AREA_COLOR, active: true });
         } catch { /* region not computable yet */ }
+    }
+    // Drawn areas stay on the plot (faint) so they can be clicked; component and net
+    // areas only when selected. The selected one is drawn like an active area.
+    for (const r of p.regions) {
+        const chosen = isSel('region', r.id);
+        if (r.id === target?.region || r.shape.kind === 'remainder') continue;
+        if (!chosen && (state.hidden[`area:${r.id}`] || !['rect', 'polygon'].includes(r.shape.kind))) continue;
+        const input = p.operations.find((o) => o.region === r.id)?.input ?? p.inputs.find((i) => i.role === 'copper')?.id;
+        try {
+            const mask = shapeMask(r.shape, state.layers, input);
+            if (mask?.length) regions.push({ shape: mask, color: AREA_COLOR, active: chosen });
+        } catch { /* needs a layer that isn't open */ }
     }
 
     const markers = [];
@@ -2147,7 +2488,7 @@ const typing = (e) => /^(INPUT|SELECT|TEXTAREA)$/.test(e.target?.tagName ?? '');
 document.addEventListener('keydown', (e) => {
     if (document.querySelector('.dialog-back')) return; // the dialog handles its own keys
     if (e.key === 'Escape') { cancelDraw(); if (state.menu) { state.menu = null; renderHeader(); } return; }
-    if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === 's' || e.key === 'S')) { e.preventDefault(); saveProjectFile({ as: e.shiftKey }); return; }
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === 's' || e.key === 'S')) { e.preventDefault(); if (e.shiftKey) saveCopy(); else saveProjectFile(); return; }
     if (typing(e) || e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelected(); }
     else if (e.key === 'v' || e.key === 'V' || e.key === '1') view.fit();
@@ -2157,7 +2498,13 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('click', () => { if (state.menu) { state.menu = null; renderHeader(); } });
 document.addEventListener('dragover', (e) => { e.preventDefault(); plotPane.classList.add('drop'); });
 document.addEventListener('dragleave', (e) => { if (!e.relatedTarget) plotPane.classList.remove('drop'); });
-document.addEventListener('drop', (e) => { e.preventDefault(); plotPane.classList.remove('drop'); openFiles(e.dataTransfer.files); });
+document.addEventListener('drop', (e) => {
+    e.preventDefault();
+    plotPane.classList.remove('drop');
+    const files = [...e.dataTransfer.files];
+    if (folderReady()) openFiles(files);
+    else pendingDrop = files; // opened once the folder is chosen
+});
 
 document.getElementById('root').append(header, side, main, statusBar);
 document.body.append(toastEl);
@@ -2167,10 +2514,12 @@ await restore();
 for (const op of state.project.operations.filter((o) => !o.enabled)) command('operation.set', { operation: { ...op, enabled: true } }, { quiet: true });
 const hadView = applyRestoredUi();
 const missingFiles = state.project.inputs.filter((i) => !state.layers[i.id]).map((i) => i.file);
-if (missingFiles.length) {
-    state.status = state.status ?? { text: state.lastFileName && !state.file
-        ? `Restored "${state.project.name}" without its board files. Open ${state.lastFileName} (File → Open project) or the board files to continue.`
-        : `Restored "${state.project.name}". Open ${missingFiles.join(', ')} (File → Open all board files) to continue.` };
+if (!state.file && state.fileHint?.external) {
+    state.status = state.status ?? { text: `Reopen your project: open ${state.fileHint.name} in the Project tab to continue.` };
+} else if (!state.folder && state.folderHint) {
+    state.status = state.status ?? { text: `${folderPrompt().title}: choose "${state.folderHint.name}" in the Project tab to continue.` };
+} else if (missingFiles.length) {
+    state.status = state.status ?? { text: `Restored "${state.project.name}". Open ${missingFiles.join(', ')} (File → Open all board files) to continue.` };
 } else if (state.file?.status === 'paused') {
     state.status = state.status ?? { err: true, text: `Not saving to ${state.file.name} until you allow it: File → Save project.` };
 }
@@ -2181,5 +2530,7 @@ refresh({ fit: !hadView });
 scheduleGeometry();
 // CNC jobs that had G-code get it back (generation is deterministic).
 for (const job of state.jobs) if (job.rerun) { delete job.rerun; runJob(job); }
+autosaveOn = true;
+setInterval(autosave, AUTOSAVE_MS);
 // Follow gSender's light/dark setting.
 setInterval(() => { getWorkspaceState().then(applyTheme).catch(() => {}); }, 5000);

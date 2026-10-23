@@ -14,3 +14,4 @@ export { multiDepth } from './ops/common.js';
 export { drillMethod } from './ops/drilling.js';
 export { emitGrbl } from './gcode/grbl.js';
 export { narrowGaps, analyzeProject, suggestRegions } from './analysis/index.js';
+export { CORE_VERSION, PROJECT_FORMAT, runnableProject, layersFromFiles, generateJob, gcodeHash, sha256Hex } from './job.js';
