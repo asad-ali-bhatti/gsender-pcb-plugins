@@ -1,6 +1,8 @@
 // Run plan: which jobs run, in what order, and the steps that follows from it.
 // Pure module. Steps are plain data so they can be saved in the run file.
 
+import { needsLevel, probeStep } from './level.js';
+
 /** Jobs that are selected by default: every runnable job, in project order. */
 export function defaultSelection(jobs) {
     return jobs.filter((j) => j.status === 'ready').map((j) => j.id);
@@ -96,6 +98,11 @@ function commandStep(cmd) {
  * They go after the job's automatic bit change, so a reminder such as "switch
  * the router on" comes once the bit is in. A bit change the user added sets up
  * the bit of the next job, and replaces the automatic one there.
+ *
+ * Jobs that cut at copper depth are levelled (`level: true`), and the probe
+ * step comes once, just after the bit change for the first of them: the bit
+ * is in and Z is zeroed, and nothing the user added (such as "switch the
+ * router on") runs before it.
  */
 export function planSteps(jobs, ids, commands = {}) {
     const byId = new Map(jobs.map((j) => [j.id, j]));
@@ -126,6 +133,7 @@ export function planSteps(jobs, ids, commands = {}) {
                 lines: f.lines,
                 minutes: f.minutes,
                 bit,
+                level: needsLevel(f),
                 status: 'pending',
                 attempts: 0,
                 startedAt: null,
@@ -137,6 +145,12 @@ export function planSteps(jobs, ids, commands = {}) {
             prevBit = bit;
         });
         after.forEach((c) => add(commandStep(c)));
+    }
+    const probe = probeStep(jobs, ids);
+    const first = steps.findIndex((s) => s.kind === 'run' && s.level);
+    if (probe && first >= 0) {
+        const bit = steps.slice(0, first).findLastIndex((s) => s.kind === 'bit');
+        steps.splice(bit >= 0 ? bit + 1 : first, 0, probe);
     }
     return steps;
 }

@@ -12,6 +12,8 @@ const store=JSON.parse(localStorage.getItem('mock-store')||'{}'), keep=()=>local
 const wco={x:-100,y:-80,z:-40};           // machine = work + wco
 let pos={x:0,y:0,z:5};                    // work coords
 let zoff=0;                               // G10 shifts
+const mpos=()=>({x:pos.x+wco.x,y:pos.y+wco.y,z:pos.z+wco.z+zoff});
+const sync=()=>{const st=redux.controller.state.status; st.wpos={...pos}; st.mpos=mpos();};
 const surf=(x,y)=>0.002*x-0.003*y+0.0004*(x-25)*(y-15)-0.3; // work Z of copper before re-zero
 const gc=`G21 G90\nG0 Z2\nG0 X5 Y5\nG1 Z-0.05 F60\nG1 X45 Y5 F300\nG2 X45 Y25 I0 J10\nG1 X5 Y25\nG0 Z2\nM5`;
 const redux={connection:{isConnected:true},controller:{state:{status:{activeState:'Idle',pinState:{}}}},
@@ -37,7 +39,7 @@ async function handle(t,p){switch(t){
  case 'machine:get:context': return {connected:true,position:{x:pos.x+wco.x,y:pos.y+wco.y,z:pos.z+wco.z+zoff},workPosition:{...pos}};
  case 'redux:get:state': return redux;
  case 'workspace:get:state': return {toolChangeOption:'Ignore',enableDarkMode:true};
- case 'machine:query': { await new Promise(r=>setTimeout(r,5)); const lines=query(p.cmd); redux.controller.state.status.wpos={...pos}; return {lines,complete:true,reason:'until'}; }
+ case 'machine:query': { await new Promise(r=>setTimeout(r,5)); const lines=query(p.cmd); sync(); return {lines,complete:true,reason:'until'}; }
  case 'machine:busy:set': H.busy.push(p.busy); return {ok:true};
  case 'machine:command': H.commands.push(p.cmd); command(p.cmd,p.args); return {ok:true};
  case 'viewer:overlay:set': H.overlay=p.markers; draw(); return {ok:true};
@@ -68,8 +70,8 @@ H.fault=k=>{ if(k==='close'){clearInterval(timer); emit('serialport:close'); red
   if(k==='alarm'){clearInterval(timer); setActive('Alarm');}};
 setInterval(()=>{ if(redux.connection.isConnected) emit('controller:state','Grbl',{status:{activeState:active,wpos:{...pos}}}); },1000);
 // H.jog(x, y) moves in work coordinates, like jogging in gSender.
-H.jog=(x,y)=>{pos.x=x; pos.y=y; redux.controller.state.status.wpos={...pos}; emit('controller:state','Grbl',{status:{activeState:active,wpos:{...pos}}});};
-redux.controller.workflow={state:'idle'};
+H.jog=(x,y)=>{pos.x=x; pos.y=y; sync(); emit('controller:state','Grbl',{status:{activeState:active,wpos:{...pos}}});};
+redux.controller.workflow={state:'idle'}; sync();
 addEventListener('message',async e=>{const d=e.data; if(!d||d.channel!==CH)return;
   if(d.subscribe){subs.push({src:e.source,id:d.subscribe.id,topic:d.subscribe.topic}); return;}
   if(d.unsubscribe){const i=subs.findIndex(s=>s.id===d.unsubscribe.id); if(i>=0)subs.splice(i,1); return;}

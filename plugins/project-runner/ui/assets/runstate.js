@@ -6,13 +6,15 @@
 // were checked when it started even if the project is edited meanwhile.
 
 import { planSteps, bitStep, bitLabel } from './plan.js';
+import { sameGrid, mapRange } from './level.js';
+import { isComplete as mapComplete } from '../vendor/autoleveler/leveling.js';
 
 export const RUN_FORMAT = 'pcb-project-run';
-export const RUN_VERSION = 4;
+export const RUN_VERSION = 5;
 export const HISTORY_LIMIT = 200;
 
 export const STEP_STATUSES = ['pending', 'active', 'done', 'skipped', 'failed', 'cancelled'];
-export const STEP_KINDS = ['origin', 'run', 'bit', 'note', 'gcode'];
+export const STEP_KINDS = ['origin', 'run', 'bit', 'note', 'gcode', 'probe'];
 const FINISHED = new Set(['done', 'skipped']);
 
 /** The first step of every run: jog to the board's corner and set X0 Y0 there. */
@@ -32,6 +34,7 @@ export function createRun({ doc, fileName, jobs, ids, commands = {}, now = Date.
         selection: [...ids],
         commands,
         steps: [originStep(), ...planSteps(jobs, ids, commands)],
+        map: null, // the height map (Autoleveler format, plus `origin`), once probing starts
         history: [],
     };
 }
@@ -47,7 +50,8 @@ export function parseRun(text) {
     if (run.version > RUN_VERSION) return { ok: false, message: 'This run file was made by a newer Project Runner. Update the plugin to open it.' };
     if (!run.project?.doc?.project || !Array.isArray(run.steps)) return { ok: false, message: 'This run file is damaged (no project or steps).' };
     if (run.version < 2) migrateV1(run);
-    run.version = RUN_VERSION; // versions 3 and 4 only added step kinds
+    run.version = RUN_VERSION; // versions 3 to 5 only added step kinds (and `map` in 5)
+    run.map ??= null;
     for (const s of run.steps) {
         if (!s || typeof s.id !== 'string' || !STEP_STATUSES.includes(s.status) || !STEP_KINDS.includes(s.kind)) return { ok: false, message: 'This run file is damaged (a step is unreadable).' };
     }
@@ -88,17 +92,25 @@ export function currentStep(run) {
  */
 export function runStarted(run) {
     const since = run.history.findLastIndex((e) => e.result === 'restarted');
-    return run.history.length > since + 1 || run.steps.some((s) => s.status !== 'pending' || (s.kind === 'bit' && s.stage !== 'change'));
+    return run.history.length > since + 1 || run.steps.some((s) => (s.status !== 'pending' && !s.kept) || (s.kind === 'bit' && s.stage !== 'change'));
 }
 
 /**
  * Starts the run over: fresh steps from the same jobs, order and added steps.
- * The history stays, with a "Run restarted" entry. `jobs` are the inspected
- * jobs of run.project.doc. Returns null when a job no longer matches the run.
+ * The history stays, with a "Run restarted" entry. A complete height map is
+ * kept (it is relative to the copper at X0 Y0; a moved X0 Y0 is caught before
+ * a levelled job loads). `jobs` are the inspected jobs of run.project.doc.
+ * Returns null when a job no longer matches the run.
  */
 export function restartRun(run, jobs, now = Date.now()) {
     if (changedSteps({ ...run, steps: run.steps.map((s) => ({ ...s, status: 'pending' })) }, jobs).length) return null;
     run.steps = [originStep(), ...planSteps(jobs, run.selection, run.commands ?? {})];
+    const probe = run.steps.find((s) => s.kind === 'probe');
+    if (probe && mapComplete(run.map) && sameGrid(run.map, probe.grid)) {
+        Object.assign(probe, { status: 'done', kept: true, startedAt: now, endedAt: now, note: 'Map kept from before the restart' });
+    } else {
+        run.map = null;
+    }
     run.history.push({ step: null, job: 'Run restarted', file: null, bit: null, start: now, end: now, result: 'restarted', line: null, lines: null, note: null });
     if (run.history.length > HISTORY_LIMIT) run.history.splice(0, run.history.length - HISTORY_LIMIT);
     touch(run, now);
@@ -115,7 +127,7 @@ export function summary(run) {
 
 function touch(run, now) { run.updatedAt = now; }
 
-const STEP_TITLES = { origin: 'Set X0 Y0', bit: 'Bit change', note: 'Pause', gcode: 'G-code' };
+const STEP_TITLES = { origin: 'Set X0 Y0', bit: 'Bit change', note: 'Pause', gcode: 'G-code', probe: 'Height map' };
 
 function record(run, step, result, now, note = null) {
     run.history.push({
@@ -225,6 +237,53 @@ export function finishCommandStep(run, id, now = Date.now()) {
     record(run, s, 'done', now, s.kind === 'gcode' ? s.text.split('\n')[0] : null);
     touch(run, now);
     return s;
+}
+
+// ---------------------------------------------------------------------------
+// Height map
+// ---------------------------------------------------------------------------
+
+export const probeStepOf = (run) => run.steps.find((s) => s.kind === 'probe') ?? null;
+
+/** Probing began: the map (empty, or partly probed) is kept in the run from now on. */
+export function startProbe(run, id, map, now = Date.now()) {
+    const s = stepOf(run, id);
+    if (!s || s.kind !== 'probe' || FINISHED.has(s.status)) return null;
+    s.startedAt ??= now;
+    run.map = map;
+    touch(run, now);
+    return s;
+}
+
+/** The map is complete: the probe step is done. `origin` is the machine XY of X0 Y0 now. */
+export function finishProbe(run, id, origin = null, now = Date.now()) {
+    const s = stepOf(run, id);
+    if (!s || s.kind !== 'probe' || FINISHED.has(s.status) || !mapComplete(run.map)) return null;
+    run.map.origin = origin;
+    Object.assign(s, { status: 'done', endedAt: now, kept: false, note: null });
+    s.startedAt ??= now;
+    const range = mapRange(run.map);
+    record(run, s, 'done', now, `${run.map.nx * run.map.ny} points, copper varies ${range.toFixed(2)} mm`);
+    touch(run, now);
+    return s;
+}
+
+/** Throws the map away and makes the probe step the next thing to do. */
+export function reprobe(run, now = Date.now()) {
+    const s = probeStepOf(run);
+    if (!s) return null;
+    Object.assign(s, { status: 'pending', startedAt: null, endedAt: null, kept: false, note: null });
+    run.map = null;
+    touch(run, now);
+    return s;
+}
+
+/**
+ * Whether run step `step` runs levelled: a job cutting at copper depth, with
+ * the board probed. When probing was skipped it runs as generated.
+ */
+export function levelsWith(run, step) {
+    return !!step?.level && probeStepOf(run)?.status === 'done' && mapComplete(run.map);
 }
 
 // ---------------------------------------------------------------------------

@@ -70,17 +70,18 @@ test('planSteps puts commands around their job and lets a bit change replace the
         cutout: { after: [c('bit', 'c4')] },
     };
     const steps = planSteps(jobs, ['iso', 'drill', 'cutout'], commands);
-    assert.deepEqual(steps.map((s) => s.id), ['bit@iso#1', 'cmd:c1', 'iso#1', 'cmd:c2', 'bit:c3', 'drill#1', 'bit@cutout#1', 'cutout#1', 'bit:c4']);
-    assert.equal(steps[1].text, 'Switch the router on');
-    assert.equal(steps[4].bit.id, steps[5].bit.id);   // set up for the drill
-    assert.equal(steps[4].auto, false);
+    // The probe comes straight after the bit change, before "switch the router on".
+    assert.deepEqual(steps.map((s) => s.id), ['bit@iso#1', 'probe', 'cmd:c1', 'iso#1', 'cmd:c2', 'bit:c3', 'drill#1', 'bit@cutout#1', 'cutout#1', 'bit:c4']);
+    assert.equal(steps[2].text, 'Switch the router on');
+    assert.equal(steps[5].bit.id, steps[6].bit.id);   // set up for the drill
+    assert.equal(steps[5].auto, false);
     assert.equal(steps.at(-1).bit, null);
     assert.deepEqual(planWarnings(steps).map((w) => w.code), ['bit-change-at-end']);
 
     // A bit change after a job sets up the next one, so no automatic one is added there.
     const s2 = planSteps(jobs, ['iso', 'drill'], { iso: { after: [c('bit', 'c5')] } });
-    assert.deepEqual(s2.map((s) => s.id), ['bit@iso#1', 'iso#1', 'bit:c5', 'drill#1']);
-    assert.equal(s2[2].bit.id, s2[3].bit.id);
+    assert.deepEqual(s2.map((s) => s.id), ['bit@iso#1', 'probe', 'iso#1', 'bit:c5', 'drill#1']);
+    assert.equal(s2[3].bit.id, s2[4].bit.id);
     assert.deepEqual(planWarnings(s2), []);
 });
 
@@ -95,6 +96,7 @@ test('run state: pause and G-code steps, and a bit change clears doubt past them
     assert.ok(r.ok);
     assert.equal(r.run.version, S.RUN_VERSION);
     S.finishBitStep(run, 'bit@iso#1', null, 2);
+    S.skipStep(run, 'probe');
     assert.equal(S.currentStep(run).id, 'cmd:c1');
     assert.equal(S.finishCommandStep(run, 'iso#1'), null);
     S.finishCommandStep(run, 'cmd:c1', 3);

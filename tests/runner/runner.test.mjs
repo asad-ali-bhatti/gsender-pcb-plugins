@@ -59,7 +59,10 @@ test('inspectJobs: split output gives one file per bit', async () => {
     assert.equal(two.status, 'ready');
     assert.equal(two.files.length, 2);
     const steps = planSteps([two], ['two']);
-    assert.deepEqual(steps.map((s) => s.id), ['bit@two#1', 'two#1', 'bit@two#2', 'two#2']);
+    assert.deepEqual(steps.map((s) => s.id), ['bit@two#1', 'probe', 'two#1', 'bit@two#2', 'two#2']);
+    // Only the isolation file is levelled, and only its cuts set the probe area.
+    assert.deepEqual(steps.filter((s) => s.kind === 'run').map((s) => s.level), [true, false]);
+    assert.deepEqual(two.files.map((f) => f.opTypes), [['isolation'], ['cutout']]);
 });
 
 test('inspectJobs: kept G-code runs as stored unless it was out of date when kept', async () => {
@@ -100,10 +103,10 @@ test('planSteps adds a bit change where the bit changes and skips jobs that are 
     delete doc.jobs[1].gcodeHash;
     const jobs = await inspectJobs(doc);
     const steps = planSteps(jobs, ['iso', 'iso2', 'drill', 'cutout']);
-    assert.deepEqual(steps.map((s) => s.id), ['bit@iso#1', 'iso#1', 'iso2#1', 'bit@cutout#1', 'cutout#1']);
-    assert.deepEqual(steps.map((s) => s.kind), ['bit', 'run', 'run', 'bit', 'run']);
+    assert.deepEqual(steps.map((s) => s.id), ['bit@iso#1', 'probe', 'iso#1', 'iso2#1', 'bit@cutout#1', 'cutout#1']);
+    assert.deepEqual(steps.map((s) => s.kind), ['bit', 'probe', 'run', 'run', 'bit', 'run']);
     assert.equal(bitLabel(steps[0].bit), 'V-bit 30° 0.2 mm (T1)');
-    assert.equal(steps[3].bit.id, steps[4].bit.id);
+    assert.equal(steps[4].bit.id, steps[5].bit.id);
     assert.ok(steps[0].auto && steps[0].stage === 'change');
 });
 
@@ -116,6 +119,8 @@ test('run state: lifecycle, history and round trip', async () => {
     assert.equal(S.startStep(run, 'bit@iso#1'), null);   // a bit change isn't a job
     S.finishBitStep(run, 'bit@iso#1', { machineZ: -40.15 }, 1);
     assert.equal(run.history.at(-1).job, 'Bit change');
+    assert.equal(S.currentStep(run).id, 'probe');
+    S.skipStep(run, 'probe');
     assert.equal(S.currentStep(run).id, 'iso#1');
     S.startStep(run, 'iso#1', 2);
     assert.equal(S.currentStep(run).status, 'active');
@@ -137,7 +142,7 @@ test('run state: lifecycle, history and round trip', async () => {
     S.markDone(run, 'cutout#1', 8);
     assert.ok(S.isComplete(run));
     assert.equal(S.currentStep(run), null);
-    assert.deepEqual(S.summary(run), { total: 7, pending: 0, active: 0, done: 4, skipped: 3, failed: 0, cancelled: 0, complete: true });
+    assert.deepEqual(S.summary(run), { total: 8, pending: 0, active: 0, done: 4, skipped: 4, failed: 0, cancelled: 0, complete: true });
 
     const back = S.parseRun(S.serializeRun(run));
     assert.ok(back.ok);
@@ -184,6 +189,7 @@ test('run state: bit changes can be added, removed and decide when to confirm by
     assert.ok(S.needsBitConfirm(run, 'iso#1'));               // its bit change isn't done
     assert.equal(S.setBitStage(run, 'bit@iso#1', 'zero').stage, 'zero');
     S.finishBitStep(run, 'bit@iso#1', { machineZ: -40 });
+    S.skipStep(run, 'probe');
     assert.ok(!S.needsBitConfirm(run, 'iso#1'));
     assert.equal(S.insertBitChange(run, 'drill#1'), null);   // one is already waiting there
     assert.ok(!S.removeBitChange(run, 'bit@drill#1'));         // planned ones stay

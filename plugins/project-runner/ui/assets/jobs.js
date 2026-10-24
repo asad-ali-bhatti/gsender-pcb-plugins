@@ -58,6 +58,8 @@ export async function inspectJob(doc, job, { toolChangeOption } = {}) {
     const files = [];
     for (const f of r.files) {
         const tools = f.tools.map((n) => project.tools.find((t) => t.toolNumber === n)).filter(Boolean);
+        const toolIds = new Set(tools.map((t) => t.id));
+        const fileOps = (r.operations ?? []).filter((o) => toolIds.has(o.tool));
         files.push({
             name: f.name,
             gcode: f.gcode,
@@ -66,6 +68,7 @@ export async function inspectJob(doc, job, { toolChangeOption } = {}) {
             bits: tools.map((t) => ({ id: t.id, name: t.name, toolNumber: t.toolNumber, type: t.type })),
             minutes: f.stats?.minutes ?? null,
             bounds: f.stats?.bounds ?? null,
+            opTypes: [...new Set(fileOps.map((o) => o.type))],
             flip: /^M0\b/m.test(f.gcode),
         });
     }

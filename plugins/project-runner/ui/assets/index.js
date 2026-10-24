@@ -1,7 +1,8 @@
 // Project Runner panel (visualizer overlay, so it stays loaded on every page
 // and keeps following a job). A short wizard: open a PCB CAM project file,
 // 1. pick its jobs, 2. put them in order and add pauses, G-code or bit changes
-// around them, 3. run them one by one through gSender's own sender. Every machine motion
+// around them, 3. run them one by one through gSender's own sender, probing the
+// board once and levelling the copper-depth jobs on the way. Every machine motion
 // starts from a click here or in gSender; the Runner never starts one itself.
 
 import { machine, gcode, storage, getReduxState, getWorkspaceState, subscribeWorkspaceState } from '@sienci/gsender-plugin-sdk';
@@ -11,7 +12,9 @@ import { COMMAND_TYPES, makeCommand, commandProblem, checkGcode, runGcode } from
 import {
     createRun, parseRun, serializeRun, currentStep, stepOf, startStep, progressStep, endStep, skipStep, markDone, retryStep, changedSteps, runFileName,
     setBitStage, finishBitStep, insertBitChange, removeBitChange, needsBitConfirm, bitStepFor, finishCommandStep, runStarted, restartRun, finishOriginStep,
+    startProbe, finishProbe, reprobe, levelsWith, probeStepOf,
 } from './runstate.js';
+import { needsLevel, probeMap, canResume, probeMinutes, levelFile, leveledName, originMoved, mapRange, SCAN_SETTINGS } from './level.js';
 import { createTracker, track } from './tracker.js';
 import { zeroZ, raiseForBitChange, setXYOrigin, clampRaise, ZERO_DEFAULTS, ZERO_LIMITS } from './zeroz.js';
 import { fileApi, pickOpen, pickSave, writePermission, writeText, readText, savedHandle } from './files.js';
@@ -39,7 +42,8 @@ const state = {
     loaded: null,            // { step, name, total } once gSender reports our file
     tracker: null,           // { step, t }
     confirmed: false,        // "bit is in and Z is zeroed" ticked for the current step
-    motion: null,            // { step, what: 'raise' | 'zero', status } while the Runner moves the machine
+    motion: null,            // { step, what: 'raise' | 'zero' | 'origin' | 'gcode' | 'probe', status } while the Runner moves the machine
+    levelIssue: null,        // { step, text } why the current levelled job can't load or start (X0 Y0 moved)
     abort: false,            // Stop pressed during that motion
     busy: null,              // text while opening / loading / starting
     msg: null,               // { kind, text }
@@ -220,7 +224,7 @@ function restartCard() {
         h('ul', { className: 'warnlist' },
             h('li', {}, 'All progress is reset to step 1.', done ? [' ', b(`${plural(done, 'done job')} will be cut again.`)] : ''),
             h('li', {}, 'Lost position (alarm, reset, power off)? ', b('Home'), ' and check X0 Y0 first.'),
-            h('li', { className: 'muted' }, 'History is kept.')),
+            h('li', { className: 'muted' }, probeStepOf(run) && run.map ? 'History and the height map are kept.' : 'History is kept.')),
         h('div', { className: 'row' },
             button('Cancel', () => { state.confirmRestart = false; render(); }, { kind: 'grow0' }),
             button('Restart run', doRestart, { kind: 'danger' })));
@@ -256,7 +260,8 @@ function backFromRun(view) {
 function closeRun() {
     clearTimeout(saveTimer);
     saveTimer = null;
-    Object.assign(state, { run: null, runJobs: null, changed: new Set(), handle: null, file: null, loaded: null, tracker: null, confirmed: false, showHistory: false, confirmRestart: false });
+    levelCache = null;
+    Object.assign(state, { run: null, runJobs: null, changed: new Set(), handle: null, file: null, loaded: null, tracker: null, confirmed: false, showHistory: false, confirmRestart: false, levelIssue: null });
 }
 
 async function endRun() {
@@ -334,6 +339,43 @@ function savePointer() {
 const isRunning = () => !!state.motion || (state.tracker && ['running', 'paused'].includes(state.tracker.t.phase));
 const filesOf = (step) => state.runJobs?.find((j) => j.id === step.job)?.files.find((f) => f.name === step.file) ?? null;
 
+/** The name gSender has run step `step` under: "_leveled" when it runs with the height map. */
+const gsName = (step) => (levelsWith(state.run, step) ? leveledName(step.file) : step.file);
+
+let levelCache = null; // { key, r } the last levelled file (one job's G-code)
+
+/**
+ * What gSender runs for run step `step`: the job as generated, or levelled
+ * with the run's height map. Levelling always starts from the regenerated
+ * original, so a job is never levelled twice.
+ * @returns {null | { name, gcode, lines, levelled, warnings } | { name, levelled: true, error }}
+ */
+function jobFile(step) {
+    const f = filesOf(step);
+    if (!f) return null;
+    if (!levelsWith(state.run, step)) return { name: step.file, gcode: f.gcode, lines: f.lines, levelled: false, warnings: [] };
+    const key = `${step.id}|${f.hash}|${state.run.map.createdAt}`;
+    if (levelCache?.key !== key) levelCache = { key, r: levelFile(f.gcode, state.run.map) };
+    const r = levelCache.r;
+    const name = leveledName(step.file);
+    return r.ok ? { name, gcode: r.gcode, lines: r.lines, levelled: true, warnings: r.warnings } : { name, levelled: true, error: r.message };
+}
+
+/** Machine XY of work X0 Y0 now (machine minus work position), or null. */
+async function originNow() {
+    const st = await statusOf();
+    const v = ['x', 'y'].map((k) => Number(st.mpos?.[k]) - Number(st.wpos?.[k]));
+    return v.every(Number.isFinite) ? { x: Math.round(v[0] * 1000) / 1000, y: Math.round(v[1] * 1000) / 1000 } : null;
+}
+
+/** Why a levelled job can't load or start now (X0 Y0 moved since probing); null when it can. */
+async function levelProblem(step) {
+    if (!levelsWith(state.run, step)) return null;
+    let origin = null;
+    try { origin = await originNow(); } catch { /* outside gSender */ }
+    if (!originMoved(state.run.map, origin)) return null;
+    return 'X0 Y0 moved since the board was probed, so the height map no longer fits. Set X0 Y0 back, or probe again.';
+}
 function feed(ev) {
     const tr = state.tracker;
     if (!tr) return;
@@ -343,7 +385,12 @@ function feed(ev) {
     const step = run && stepOf(run, tr.step);
     if (!step) { state.tracker = null; return; }
     if (out.kind === 'started') {
-        if (step.status !== 'active') startStep(run, step.id);
+        if (step.status !== 'active') {
+            // gSender's own Start on our file (see adoptRunningJob).
+            startStep(run, step.id);
+            const f = jobFile(step);
+            if (f && !f.error) Object.assign(step, { lines: f.lines, levelled: f.levelled ? { at: run.map.createdAt } : null });
+        }
         saveRun(true);
         render();
     } else if (out.kind === 'progress') {
@@ -405,7 +452,7 @@ function noteLoaded() {
     const st = state.gs.sender;
     const step = state.run && currentStep(state.run);
     if (!st || !step) return;
-    if (st.name === step.file && st.total > 0) {
+    if (st.name === gsName(step) && st.total > 0) {
         if (state.loaded?.name !== st.name || state.loaded.total !== st.total) { state.loaded = { step: step.id, name: st.name, total: st.total }; render(); }
     } else if (state.loaded && st.name && st.name !== state.loaded.name) {
         state.loaded = null; // something else was loaded into gSender
@@ -416,8 +463,8 @@ function noteLoaded() {
 function adoptRunningJob() {
     const step = state.run && currentStep(state.run);
     const st = state.gs.sender;
-    if (!step || state.changed.has(step.id) || !st || st.name !== step.file) return;
-    state.tracker = { step: step.id, t: createTracker(step.file, { total: st.total }) };
+    if (!step || step.kind !== 'run' || state.changed.has(step.id) || !st || st.name !== gsName(step)) return;
+    state.tracker = { step: step.id, t: createTracker(st.name, { total: st.total }) };
 }
 
 /** After opening a run: follow a job that is already running in gSender. */
@@ -429,8 +476,8 @@ async function attachToLiveJob() {
         const wf = rs?.controller?.workflow?.state;
         const sender = rs?.controller?.sender?.status;
         if (sender?.name) state.gs.sender = { name: sender.name, total: Number(sender.total) || 0, received: Number(sender.received) || 0 };
-        if ((wf === 'running' || wf === 'paused') && sender?.name === step.file) {
-            const t = createTracker(step.file, { total: Number(sender.total) || 0 });
+        if ((wf === 'running' || wf === 'paused') && sender?.name === gsName(step)) {
+            const t = createTracker(sender.name, { total: Number(sender.total) || 0 });
             t.phase = wf;
             t.received = Number(sender.received) || 0;
             state.tracker = { step: step.id, t };
@@ -473,11 +520,30 @@ const machineIo = () => ({
         const y = Number(st.wpos?.y);
         return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
     },
+    readWcoZ,
     aborted: () => state.abort,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     log: () => {},
     status: (text) => { if (state.motion) { state.motion.status = text; render(); } },
 });
+
+/**
+ * Work Z offset (machine Z of work Z0) from the controller's status reports,
+ * as in the Autoleveler: waits for Idle and a steady value (and, with
+ * `atCurrent`, for work Z 0, so a WCO from before a G10 is never used).
+ */
+async function readWcoZ({ atCurrent = false } = {}) {
+    let last = null;
+    for (let waited = 0; waited < 5000; waited += 250) {
+        const st = await statusOf();
+        const wco = Number(st.mpos?.z) - Number(st.wpos?.z);
+        const ready = st.activeState === 'Idle' && Number.isFinite(wco) && (!atCurrent || Math.abs(Number(st.wpos?.z)) < 0.005);
+        if (ready && last !== null && Math.abs(wco - last) < 1e-4) return wco;
+        last = ready ? wco : null;
+        await new Promise((res) => setTimeout(res, 250));
+    }
+    throw new Error('The machine didn\'t report its Z offset. Check that it is connected and idle, then try again.');
+}
 
 /** Why the Runner can't move the machine now, in plain words; null when it can. */
 function motionBlocker() {
@@ -532,7 +598,9 @@ async function zeroStep(step) {
     finishBitStep(state.run, step.id, result);
     state.confirmed = false;
     saveRun(true);
-    setMsg('ok', 'Z is zeroed on the copper at X0 Y0. Take the probe clip off the bit now.');
+    setMsg('ok', currentStep(state.run)?.kind === 'probe'
+        ? 'Z is zeroed at X0 Y0. Leave the probe clip on: the board is probed next.'
+        : 'Z is zeroed on the copper at X0 Y0. Take the probe clip off the bit now.');
 }
 
 async function originStep(step) {
@@ -544,9 +612,56 @@ async function originStep(step) {
     });
     if (!ok || !state.run) return;
     finishOriginStep(state.run, step.id, machinePos);
+    state.levelIssue = null;
     saveRun(true);
     const next = currentStep(state.run);
     setMsg('ok', `X0 Y0 set.${next ? ` Next: ${nextText(next)}.` : ''}`);
+}
+
+/**
+ * Probes the height map over the step's grid, or continues a map that was
+ * stopped part way (its first point is probed again and must read the same).
+ */
+async function probeBoard(step, { fresh = false } = {}) {
+    const run = state.run;
+    if (fresh) run.map = null;
+    const total = step.grid.nx * step.grid.ny;
+    const done = () => (run.map?.z ?? []).filter(Number.isFinite).length;
+    let origin = null;
+    const ok = await withMotion(step, 'probe', 'Probing…', async (io) => {
+        const status = io.status;
+        await probeMap({
+            ...io,
+            status: (text) => status(`${text} ${done()} of ${total} done.`),
+            onMap: (m) => { startProbe(run, step.id, m); saveRun(true); },
+            onPoint: () => saveRun(),
+        }, step.grid, run.map, { touchTest: !clipProven(step) });
+        origin = await originNow();
+    });
+    if (!state.run) return;
+    if (!ok) { saveRun(true); render(); return; }
+    finishProbe(run, step.id, origin);
+    saveRun(true);
+    const next = currentStep(run);
+    setMsg('ok', `Board probed: the copper varies ${mapRange(run.map).toFixed(2)} mm.${next ? ` Next: ${nextText(next)}.` : ''}`);
+}
+
+/**
+ * Zero Z touched the copper with this clip just before (the step before is a
+ * bit change done less than 15 min ago), so the probe needs no touch test.
+ */
+function clipProven(step) {
+    const prev = state.run.steps[state.run.steps.indexOf(step) - 1];
+    return prev?.kind === 'bit' && prev.status === 'done' && Date.now() - (prev.endedAt ?? 0) < 15 * 60 * 1000;
+}
+
+/** The user wants a new height map: the probe step comes up next. */
+function probeAgain() {
+    if (isRunning()) { setMsg('warn', 'Wait until the machine has stopped.'); return; }
+    reprobe(state.run);
+    Object.assign(state, { loaded: null, confirmed: false, levelIssue: null });
+    saveRun(true);
+    setMsg('ok', 'The old height map is gone. Probe the board again.');
 }
 
 /** Feed hold, then a soft reset: stops any motion at once (as the Autoleveler's Stop). */
@@ -601,6 +716,7 @@ function nextText(s) {
     if (s.kind === 'bit') return `change to the ${s.bit?.name ?? 'next bit'}`;
     if (s.kind === 'note') return `a pause ("${s.text}")`;
     if (s.kind === 'gcode') return 'send your G-code';
+    if (s.kind === 'probe') return 'probe the board';
     return s.jobName;
 }
 
@@ -609,18 +725,23 @@ function nextText(s) {
 // ---------------------------------------------------------------------------
 
 async function loadStep(step) {
-    const f = filesOf(step);
+    const f = jobFile(step);
     if (!f) { setMsg('err', 'This job\'s G-code is missing. Start a new run from the project file.'); return; }
+    if (f.error) { setMsg('err', f.error); return; }
     if (state.gs.workflow !== 'idle') { setMsg('warn', 'gSender is busy with a job. Wait until it has ended.'); return; }
-    state.busy = `Loading ${step.file}…`;
+    const issue = await levelProblem(step);
+    state.levelIssue = issue ? { step: step.id, text: issue } : null;
+    if (issue) { render(); return; }
+    state.busy = `Loading ${f.name}…`;
     state.loaded = null;
     state.confirmed = false;
     render();
     try {
-        await gcode.loadToVisualizer(f.gcode, step.file);
+        await gcode.loadToVisualizer(f.gcode, f.name);
         // gSender's sender reports the file a moment later (see noteLoaded).
-        await waitFor(() => state.loaded?.name === step.file, 5000);
+        await waitFor(() => state.loaded?.name === f.name, 5000);
         if (!state.loaded) setMsg('warn', 'gSender hasn\'t confirmed the file yet. Is the machine connected?');
+        else if (f.warnings.length) setMsg('warn', f.warnings.join(' '));
         else setMsg(null);
     } catch (e) {
         setMsg('err', `Could not load into gSender: ${e.message}`);
@@ -642,7 +763,9 @@ function startBlocker(step) {
     if (state.gs.workflow !== 'idle') return 'gSender still has a job open. Wait for it to end, or press Stop in gSender.';
     if (!state.gs.activeState) return 'Waiting for the machine to report its state.';
     if (state.gs.activeState !== 'Idle') return `The machine is not idle (${state.gs.activeState}).`;
-    const f = filesOf(step);
+    const f = jobFile(step);
+    if (f?.error) return f.error;
+    if (state.levelIssue?.step === step.id) return state.levelIssue.text;
     if (!state.loaded || state.loaded.step !== step.id) return 'Load the job into gSender first.';
     // gSender counts the file's non-empty lines plus one line it appends.
     if (f && state.loaded.total !== f.lines && state.loaded.total !== f.lines + 1) {
@@ -655,9 +778,14 @@ function startBlocker(step) {
 async function startJob(step) {
     const why = startBlocker(step);
     if (why) { setMsg('warn', why); return; }
+    const issue = await levelProblem(step);
+    if (issue) { state.levelIssue = { step: step.id, text: issue }; setMsg('err', issue); return; }
+    const f = jobFile(step);
     state.busy = 'Starting…';
-    state.tracker = { step: step.id, t: createTracker(step.file, { total: state.loaded.total }) };
+    state.tracker = { step: step.id, t: createTracker(f.name, { total: state.loaded.total }) };
     startStep(state.run, step.id);
+    // Progress and history count the lines of what actually runs.
+    Object.assign(step, { lines: f.lines, levelled: f.levelled ? { at: state.run.map.createdAt } : null });
     await saveRun(true);
     render();
     try {
@@ -1054,6 +1182,14 @@ function autoBitRow(step) {
         h('span', { className: 'tag' }, 'automatic'));
 }
 
+function probeRow(step) {
+    const g = step.grid;
+    return h('li', { className: 'auto', title: 'Added because these jobs cut at copper depth. It comes once, before the first of them.' },
+        h('span', { className: 'g' }, '▦'),
+        h('span', { className: 't' }, `Probe the board: ${g.nx * g.ny} points, ~${Math.max(1, Math.round(probeMinutes(g)))} min`),
+        h('span', { className: 'tag' }, 'automatic'));
+}
+
 function jobBlock(job, i, n) {
     const c = commandsOf(job.id);
     const move = (dir) => moveAnimated(job.id, moveJob(state.ids, job.id, dir));
@@ -1064,7 +1200,7 @@ function jobBlock(job, i, n) {
             h('span', { className: 'num' }, `${i + 1}`),
             h('div', { className: 'jt' },
                 h('b', { title: job.name }, job.name),
-                h('div', { className: 'meta' }, [job.what, jobBits(job).map((x) => x.name).join(' + '), job.files.length > 1 ? plural(job.files.length, 'file') : '', minutes(job.minutes)].filter(Boolean).join(' · '))),
+                h('div', { className: 'meta' }, [job.what, jobBits(job).map((x) => x.name).join(' + '), job.files.length > 1 ? plural(job.files.length, 'file') : '', needsLevel(job) ? 'levelled' : '', minutes(job.minutes)].filter(Boolean).join(' · '))),
             h('span', { className: 'move' },
                 h('button', { className: 'icon', title: 'Earlier', disabled: i === 0, onClick: () => move(-1) }, '▲'),
                 h('button', { className: 'icon', title: 'Later', disabled: i === n - 1, onClick: () => move(1) }, '▼'))),
@@ -1083,6 +1219,8 @@ function orderView() {
     const auto = new Map(steps.filter((s) => s.kind === 'bit' && s.auto).map((s) => [s.id, s]));
     const total = sel.reduce((a, j) => a + (j.minutes ?? 0), 0);
     const bitChanges = steps.filter((s) => s.kind === 'bit').length;
+    const probe = steps.find((s) => s.kind === 'probe');
+    const probeBefore = probe && steps.find((s) => s.kind === 'run' && s.level)?.job;
     const blocked = warnings.some((w) => w.severity === 'error');
     return h('div', {},
         h('p', { className: 'note' }, 'Drag to reorder (top runs first). ', b('+ Before'), ' / ', b('+ After'), ' add a pause, G-code or bit change.'),
@@ -1090,6 +1228,7 @@ function orderView() {
             h('li', { className: 'auto first', title: 'Every run starts here' }, h('span', { className: 'g' }, '⌖'), h('span', { className: 't' }, 'Set X0 Y0 at the board corner'), h('span', { className: 'tag' }, 'first')),
             sel.map((j, i) => [
             auto.has(`bit@${j.id}#1`) ? autoBitRow(auto.get(`bit@${j.id}#1`)) : null,
+            probeBefore === j.id ? probeRow(probe) : null,
             jobBlock(j, i, sel.length),
             state.adding?.job === j.id ? addForm(j) : null,
         ])),
@@ -1141,11 +1280,12 @@ function stepRow(s, i, cur) {
         bit: () => `Change bit, zero Z${s.bit ? `: ${s.bit.name}` : ''}`,
         note: () => `Pause: ${s.text}`,
         gcode: () => `G-code: ${commandText({ type: 'gcode', text: s.text })}`,
+        probe: () => 'Probe the board (height map)',
     }[s.kind]?.() ?? s.jobName;
     const meta = s.kind === 'run'
-        ? [s.bit ? `T${s.bit.toolNumber}` : '', s.status === 'done' ? clock(s.endedAt) : minutes(s.minutes)].filter(Boolean).join(' · ')
-        : [s.kind === 'bit' && !s.auto ? 'added' : '', s.status === 'done' ? clock(s.endedAt) : ''].filter(Boolean).join(' · ');
-    const pendingGlyph = { origin: '⌖', bit: '⇄', note: '⏸', gcode: '›' }[s.kind];
+        ? [s.bit ? `T${s.bit.toolNumber}` : '', s.level && probeStepOf(run)?.status !== 'skipped' ? 'levelled' : '', s.status === 'done' ? clock(s.endedAt) : minutes(s.minutes)].filter(Boolean).join(' · ')
+        : [s.kind === 'bit' && !s.auto ? 'added' : '', s.kind === 'probe' ? `${s.grid.nx * s.grid.ny} points` : '', s.status === 'done' ? (s.kept ? 'kept' : clock(s.endedAt)) : ''].filter(Boolean).join(' · ');
+    const pendingGlyph = { origin: '⌖', bit: '⇄', note: '⏸', gcode: '›', probe: '▦' }[s.kind];
     return h('li', { className: `step ${s.kind} ${s.status} ${s === cur ? 'current' : ''}` },
         h('span', { className: 'glyph', title: s.status }, pendingGlyph && s.status === 'pending' ? pendingGlyph : GLYPH[s.status]),
         h('span', { className: 'name', title: name }, `${i + 1}. ${name}`),
@@ -1232,6 +1372,53 @@ function originCard(step) {
         h('div', { className: 'row end' }, h('button', { className: 'link', onClick: () => stepAction(skipStep, step, 'Kept the current X0 Y0.'), title: 'Keep the X0 Y0 already set in gSender' }, 'X0 Y0 is already set')));
 }
 
+function probeCard(step) {
+    const run = state.run;
+    const n = run.steps.indexOf(step) + 1;
+    const g = step.grid;
+    const total = g.nx * g.ny;
+    const head = h('div', { className: 'card-head' }, h('span', {}, `Step ${n} of ${run.steps.length}`), h('b', {}, 'Probe the board'));
+    const m = state.motion?.step === step.id ? state.motion : null;
+    if (m) {
+        return h('div', { className: 'card live' }, head,
+            h('div', {}, m.status),
+            h('div', { className: 'row' }, button('Stop', stopMotion, { kind: 'danger', title: 'Stops the machine at once (feed hold, then reset)' })));
+    }
+    const why = motionBlocker();
+    const resume = canResume(run.map, g);
+    const probed = resume ? run.map.z.filter(Number.isFinite).length : 0;
+    const size = `${fmtMm(g.xmax - g.xmin)} × ${fmtMm(g.ymax - g.ymin)} mm`;
+    return h('div', { className: 'card' }, head,
+        h('div', { className: 'bit' }, 'Measures the copper height at ', b(`${total} points`), ` (${size}), so isolation cuts the same depth everywhere. About ${Math.max(1, Math.round(probeMinutes(g)))} min.`),
+        h('ol', { className: 'todo' },
+            h('li', {}, 'Probe lead on the board copper, probe clip on the bit.'),
+            h('li', {}, `Bit tip at most ${SCAN_SETTINGS.firstTravel} mm above the copper (Zero Z leaves it at ${ZERO_DEFAULTS.retract} mm).`),
+            clipProven(step) ? null : h('li', {}, 'When asked, touch bit and copper with a screwdriver to test the clip.')),
+        h('div', { className: 'row' },
+            resume
+                ? button(`Continue probing (${probed} of ${total} done)`, () => probeBoard(step), { kind: 'primary', disabled: !!why, title: why ?? 'Checks the first point again, then probes the rest' })
+                : button(`Probe ${total} points`, () => probeBoard(step), { kind: 'primary', disabled: !!why, title: why ?? 'Moves over the board and touches the copper at each point' })),
+        why ? h('div', { className: 'note' }, why) : null,
+        h('div', { className: 'row end' },
+            resume ? h('button', { className: 'link', disabled: !!why, onClick: () => probeBoard(step, { fresh: true }), title: 'Throw away the points so far and probe all of them' }, 'Start over') : null,
+            h('button', { className: 'link', onClick: () => stepAction(skipStep, step, 'Probing skipped. The jobs run without levelling.'), title: 'The jobs then run without levelling: on a board that isn\'t flat, some cuts will be too shallow or too deep' }, 'Skip levelling')));
+}
+const fmtMm = (v) => String(Math.round(v * 10) / 10);
+
+/** For a levelled job's card: whether it runs with the map, and what to do when it can't. */
+function levelInfo(step) {
+    if (!step.level) return null;
+    const run = state.run;
+    const probe = probeStepOf(run);
+    const f = jobFile(step);
+    const issue = state.levelIssue?.step === step.id ? state.levelIssue.text : f?.error;
+    const again = h('button', { className: 'link', onClick: probeAgain, disabled: isRunning() }, 'Probe again');
+    if (issue) return h('div', { className: 'msg err' }, issue, ' ', again);
+    if (levelsWith(run, step)) return h('div', { className: 'note' }, `Levelled with the height map (copper varies ${mapRange(run.map).toFixed(2)} mm). `, again);
+    if (probe?.status === 'skipped') return h('div', { className: 'note' }, 'Not levelled: probing was skipped. ', h('button', { className: 'link', onClick: probeAgain, disabled: isRunning() }, 'Probe the board'));
+    return null;
+}
+
 function commandCard(step) {
     const run = state.run;
     const n = run.steps.indexOf(step) + 1;
@@ -1263,6 +1450,7 @@ function stepCard(step) {
     if (step.kind === 'bit') return bitCard(step);
     if (step.kind === 'note' || step.kind === 'gcode') return commandCard(step);
     if (step.kind === 'origin') return originCard(step);
+    if (step.kind === 'probe') return probeCard(step);
     const run = state.run;
     const n = run.steps.indexOf(step) + 1;
     const bit = step.bit ? bitLabel(step.bit) : 'the bit for this job';
@@ -1315,6 +1503,7 @@ function stepCard(step) {
         h('div', { className: 'bit' }, confirm
             ? [step.lastResult === 'failed' ? 'The last attempt failed, so Z may have moved. ' : 'No guided bit change for this job. ', 'Change the bit and zero Z here (', b('Change bit'), '), or confirm below that ', b(bit), ' is in and Z is zeroed.']
             : ['Bit: ', b(bit), `. Z zeroed at X0 Y0 at ${clock(zeroed?.endedAt)}.`]),
+        levelInfo(step),
         h('ol', { className: 'todo' },
             h('li', { className: loaded ? 'ok' : '' }, loaded ? `Loaded into gSender (${state.loaded.total} lines). Check the toolpath in the visualizer.` : 'Load the job into gSender and check the toolpath in the visualizer.'),
             confirm

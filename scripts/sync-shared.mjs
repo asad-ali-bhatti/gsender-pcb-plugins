@@ -14,6 +14,7 @@ export const SHARED = [
     ['plugins/pcb-cam/ui/vendor/clipper-lib.js', 'plugins/project-runner/ui/vendor/clipper-lib.js'],
     ['plugins/pcb-cam/ui/vendor/LICENSE-clipper-lib.txt', 'plugins/project-runner/ui/vendor/LICENSE-clipper-lib.txt'],
     ['plugins/autoleveler/ui/assets/leveling.js', 'plugins/project-runner/ui/vendor/autoleveler/leveling.js'],
+    ['plugins/autoleveler/ui/assets/scan.js', 'plugins/project-runner/ui/vendor/autoleveler/scan.js'],
 ];
 
 /** Relative paths of every file under `dir` (or [''] for a file). */
