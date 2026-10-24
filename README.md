@@ -73,6 +73,8 @@ A single full-featured plugin that turns Gerber and Excellon files into G-code. 
 | Tool database | Tools DB: shared bit library (V-bits with measured tip and angle) used by every tool |
 | Paste / solder-mask stencils | Solder Paste tool |
 
+Future upgrade: **bit calibration**. Cut a small test pattern, read where a copper strip begins, and PCB CAM learns what the bit really cuts. It then plans isolation around that width, so a worn bit still makes a board that matches the Gerber. Plan: [docs/bit-calibration-plan.md](docs/bit-calibration-plan.md).
+
 ## Roadmap: Project Runner plugin
 
 Runs a whole PCB CAM project on the machine: open the project file, pick the jobs, and follow the prompts. It inserts a bit change wherever the bit changes and walks you through zeroing Z after each one. It probes one height map per project and levels each job that needs it, exactly once. It tracks every job (done, cancelled, failed) and resumes after a lost connection or a power cut, with guidance when the machine coordinates can't be trusted. Plan: [docs/project-runner-plan.md](docs/project-runner-plan.md).

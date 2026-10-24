@@ -217,6 +217,7 @@ Changes to existing files:
    - MCP server exposing the commands and queries as tools, over stdio and Streamable HTTP.
    - Agent link: the plugin dials out to the server, which fetches the tool database and project on request; agent changes arrive as proposals.
    - PNG preview rendering for agents.
+6. **Later — bit calibration and width-aware isolation:** measure what a bit really cuts with a two-line test pattern, then plan isolation around that width (shallower cuts in tight gaps, a fine bit only where needed, and a preview of the finished board compared with the Gerber). Plan: [bit-calibration-plan.md](bit-calibration-plan.md).
 
 ## Phase 0 findings (2026-10-16, gSender 1.7.0-Edge-2, KiCad 10.0.5 fixtures)
 A throwaway spike plugin was run inside gSender's plugin page (served by the gSender server, opened in Chrome). It talked to a localhost Node server.
