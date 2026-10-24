@@ -1,6 +1,6 @@
 {
   "name": "gsender-pcb-plugins",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "description": "gSender plugins for PCB manufacturing: autoleveling, and FlatCAM-style isolation, drilling and cutout tools.",
   "type": "module",

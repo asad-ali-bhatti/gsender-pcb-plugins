@@ -2,7 +2,7 @@
   "id": "com.asadalibhatti.project-runner",
   "name": "Project Runner",
   "description": "Runs a PCB CAM project on the machine: pick its jobs, run them one after another through gSender, and keep track of every job in a run file.",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "engine": ">=1.6.0",
   "ui": {
     "entry": "ui/index.html",
