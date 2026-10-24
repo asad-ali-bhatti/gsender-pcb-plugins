@@ -3,39 +3,79 @@
 <div style="position:relative;width:100vw;height:100vh">
 <div id=panel style="position:absolute;right:16px;top:16px;bottom:16px;width:320px;background:#fff;display:flex;flex-direction:column"><div style="padding:8px">Autolevel</div><div style="flex:1;min-height:0;padding:8px;display:flex"><iframe id=f src="/plugins/autoleveler/index.html" style="flex:1;border:0"></iframe></div></div></div>
 <script>
+// ?plugin=pcb-cam opens that plugin full-size instead of the Autoleveler panel.
+const PLUGIN=new URLSearchParams(location.search).get('plugin');
+if(PLUGIN){const p=document.getElementById('panel');p.style.cssText='position:absolute;inset:0;background:#fff;display:flex';p.innerHTML='<iframe id=f src="/plugins/'+PLUGIN+'/index.html" style="flex:1;border:0"></iframe>';}
 const CH='gsender:plugin-bridge';
-const store={}; window.H={overlay:[],loaded:null,queries:[],busy:[],commands:[]};
+// Plugin storage survives a reload, like gSender's settings file survives a restart.
+const store=JSON.parse(localStorage.getItem('mock-store')||'{}'), keep=()=>localStorage.setItem('mock-store',JSON.stringify(store)); window.H={overlay:[],loaded:null,queries:[],busy:[],commands:[]};
 const wco={x:-100,y:-80,z:-40};           // machine = work + wco
 let pos={x:0,y:0,z:5};                    // work coords
 let zoff=0;                               // G10 shifts
+const mpos=()=>({x:pos.x+wco.x,y:pos.y+wco.y,z:pos.z+wco.z+zoff});
+const sync=()=>{const st=redux.controller.state.status; st.wpos={...pos}; st.mpos=mpos();};
 const surf=(x,y)=>0.002*x-0.003*y+0.0004*(x-25)*(y-15)-0.3; // work Z of copper before re-zero
 const gc=`G21 G90\nG0 Z2\nG0 X5 Y5\nG1 Z-0.05 F60\nG1 X45 Y5 F300\nG2 X45 Y25 I0 J10\nG1 X5 Y25\nG0 Z2\nM5`;
-const redux={connection:{isConnected:true},controller:{state:{status:{activeState:'Idle'}}},
+const redux={connection:{isConnected:true},controller:{state:{status:{activeState:'Idle',pinState:{}}}},
   file:{fileLoaded:true,name:'test.nc',content:gc,bbox:{min:{x:5,y:5,z:-0.05},max:{x:55,y:25,z:2}}}};
+// Work coords: pos; machine = pos + wco (+ zoff on Z after G10 L20). Understands
+// G91 in the same block, G53 machine moves, $G and $# like Grbl 1.1.
 function query(cmd){
   H.queries.push(cmd); const n=s=>{const m=new RegExp(s+'([-.\\d]+)').exec(cmd);return m?+m[1]:undefined};
-  if(/^G38\.2/.test(cmd)){const t=n('Z'); const sz=surf(pos.x,pos.y)-zoff; if(sz<pos.z && sz>=t){pos.z=sz; return ['[PRB:'+[pos.x+wco.x,pos.y+wco.y,pos.z+wco.z+zoff].map(v=>v.toFixed(3)).join(',')+':1]']}
+  const rel=/\bG91\b/.test(cmd), mz=()=>pos.z+wco.z+zoff;
+  if(cmd==='$G') return ['[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0]','ok'];
+  if(cmd==='$#') return ['[G54:'+[wco.x,wco.y,wco.z+zoff].map(v=>v.toFixed(3)).join(',')+']','[G92:0.000,0.000,0.000]','[TLO:0.000]','ok'];
+  if(/\bG38\.2\b/.test(cmd)){const t=rel?pos.z+n('Z'):n('Z'); const sz=surf(pos.x,pos.y)-zoff; if(sz<pos.z && sz>=t){pos.z=sz; return ['[PRB:'+[pos.x+wco.x,pos.y+wco.y,mz()].map(v=>v.toFixed(3)).join(',')+':1]','ok']}
     pos.z=t; return ['[PRB:0,0,0:0]','ALARM:5'];}
-  if(/^G10 L20 P0 Z0/.test(cmd)){zoff+=pos.z; pos.z=0; return ['ok'];}
-  if(/^G0/.test(cmd)){for(const a of 'XYZ'){const v=n(a); if(v!==undefined)pos[a.toLowerCase()]=v;} return ['ok'];}
+  if(/^G10 L20 P0\b/.test(cmd)){for(const a of 'XY'){const v=n(a),k=a.toLowerCase(); if(v!==undefined){wco[k]+=pos[k]-v; pos[k]=v;}} const z=n('Z'); if(z!==undefined){zoff+=pos.z-z; pos.z=z;} return ['ok'];}
+  if(/\bG53\b/.test(cmd)){const v=n('Z'); if(v!==undefined)pos.z=v-wco.z-zoff; return ['ok'];}
+  if(/\bG0\b/.test(cmd)){for(const a of 'XYZ'){const v=n(a); const k=a.toLowerCase(); if(v!==undefined)pos[k]=rel?pos[k]+v:v;} return ['ok'];}
   return ['ok'];
 }
 async function handle(t,p){switch(t){
  case 'storage:get': return p.key in store?store[p.key]:p.defaultValue;
- case 'storage:set': store[p.key]=JSON.parse(JSON.stringify(p.value)); return {ok:true};
- case 'storage:delete': delete store[p.key]; return {ok:true};
+ case 'storage:set': store[p.key]=JSON.parse(JSON.stringify(p.value)); keep(); return {ok:true};
+ case 'storage:delete': delete store[p.key]; keep(); return {ok:true};
  case 'machine:get:context': return {connected:true,position:{x:pos.x+wco.x,y:pos.y+wco.y,z:pos.z+wco.z+zoff},workPosition:{...pos}};
  case 'redux:get:state': return redux;
- case 'machine:query': await new Promise(r=>setTimeout(r,5)); return {lines:query(p.cmd),complete:true,reason:'until'};
+ case 'workspace:get:state': return {toolChangeOption:'Ignore',enableDarkMode:true};
+ case 'machine:query': { await new Promise(r=>setTimeout(r,5)); const lines=query(p.cmd); sync(); return {lines,complete:true,reason:'until'}; }
  case 'machine:busy:set': H.busy.push(p.busy); return {ok:true};
- case 'machine:command': H.commands.push(p.cmd); return {ok:true};
+ case 'machine:command': H.commands.push(p.cmd); command(p.cmd,p.args); return {ok:true};
  case 'viewer:overlay:set': H.overlay=p.markers; draw(); return {ok:true};
  case 'viewer:camera:set': return {ok:true};
- case 'gcode:load:to:visualizer': H.loaded=p; redux.file={...redux.file,name:p.name,content:p.gcode}; return {ok:true,name:p.name};
+ case 'gcode:load:to:visualizer': H.loaded=p; redux.file={...redux.file,name:p.name,content:p.gcode}; job={name:p.name,total:p.gcode.split('\n').filter(l=>l.trim()).length+1,received:0,finishTime:0}; setTimeout(status,100); return {ok:true,name:p.name};
  default: throw new Error('unknown '+t);}}
 function draw(){let svg=document.querySelector('body>svg'); if(!svg){svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.style.cssText=["position:fixed","inset:0","width:100vw","height:100vh","pointer-events:none","z-index:10"].join(";");document.body.appendChild(svg);}
  svg.innerHTML=''; for(const m of H.overlay){const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('cx',100+m.x*30);c.setAttribute('cy',900-m.y*30);c.setAttribute('r',m.size+2);c.setAttribute('fill',m.color||'#999');svg.appendChild(c);}}
-addEventListener('message',async e=>{const d=e.data; if(!d||d.channel!==CH||!d.request)return;
+// Controller events for plugins that subscribe (Project Runner), and a job
+// simulator behind gcode:start / pause / resume / stop. H.fault('close') drops
+// the connection mid-job; H.fault('alarm') raises an alarm.
+const subs=[]; let job={name:'',total:0,received:0,finishTime:0}, wf='idle', active='Idle', timer=null;
+function emit(name,...args){for(const s of subs) if(s.topic==='controller') s.src.postMessage({channel:CH,event:{topic:'controller',event:{name,args}}},'*');}
+const status=()=>emit('sender:status',{...job});
+const setActive=a=>{active=a; redux.controller.state.status.activeState=a; emit('controller:state','Grbl',{status:{activeState:a,wpos:{...pos}}});};
+const setWf=w=>{wf=w; redux.controller.workflow={state:w}; emit('workflow:state',w);};
+function tick(){ if(wf!=='running')return; job.received=Math.min(job.total,job.received+Math.ceil(job.total/25)); status();
+  if(job.received>=job.total){job.finishTime=Date.now(); status(); clearInterval(timer); setTimeout(()=>{setActive('Idle'); setTimeout(()=>{setWf('idle'); job.received=0; status();},600)},800);} }
+function command(cmd,args){ switch(cmd){
+  case 'gcode:start': if(!job.total)return; job.received=0; job.finishTime=0; setWf('running'); setActive('Run'); clearInterval(timer); timer=setInterval(tick,200); break;
+  case 'gcode:pause': if(wf==='running'){setWf('paused'); setActive('Hold:0');} break;
+  case 'gcode:resume': if(wf==='paused'){setWf('running'); setActive('Run');} break;
+  case 'gcode:stop': clearInterval(timer); setActive('Idle'); setWf('idle'); job.received=0; status(); break;}}
+// H.pin(true|false) sets the probe input (the Runner's touch test waits for it).
+H.pin=v=>{redux.controller.state.status.pinState=v?{P:true}:{};};
+H.fault=k=>{ if(k==='close'){clearInterval(timer); emit('serialport:close'); redux.connection.isConnected=false;}
+  if(k==='open'){emit('serialport:open'); redux.connection.isConnected=true; setActive('Idle');}
+  if(k==='alarm'){clearInterval(timer); setActive('Alarm');}};
+setInterval(()=>{ if(redux.connection.isConnected) emit('controller:state','Grbl',{status:{activeState:active,wpos:{...pos}}}); },1000);
+// H.jog(x, y) moves in work coordinates, like jogging in gSender.
+H.jog=(x,y)=>{pos.x=x; pos.y=y; sync(); emit('controller:state','Grbl',{status:{activeState:active,wpos:{...pos}}});};
+redux.controller.workflow={state:'idle'}; sync();
+addEventListener('message',async e=>{const d=e.data; if(!d||d.channel!==CH)return;
+  if(d.subscribe){subs.push({src:e.source,id:d.subscribe.id,topic:d.subscribe.topic}); return;}
+  if(d.unsubscribe){const i=subs.findIndex(s=>s.id===d.unsubscribe.id); if(i>=0)subs.splice(i,1); return;}
+  if(!d.request)return;
   let res; try{res={id:d.request.id,ok:true,result:await handle(d.request.type,d.request.payload||{})}}catch(err){res={id:d.request.id,ok:false,error:err.message}}
   e.source.postMessage({channel:CH,response:res},'*');});
 </script>

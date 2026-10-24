@@ -6,9 +6,12 @@
     --border: #d0d7de;
     --accent: #0a9e78;
     --accent-text: #ffffff;
+    --ok: #1a7f37;
     --danger: #cf222e;
     --warn: #9a6700;
     --input: #ffffff;
+    --ic-void: var(--bg); --ic-cu: #c8793f; --ic-cu-hi: #e3a066; --ic-cu-dk: #8a4a1f; --ic-fr4: #ddd6a2; --ic-fr4-l: #bdb47b; --ic-fr4-r: #a0975f; --ic-spoil: #c8a77a;
+    --ic-hole: #3a3424; --ic-edge: #3b2e20; --ic-bit: #a3aab2; --ic-bit-hi: #e8ebee; --ic-bit-edge: #5a6169; --ic-dim: #1f6feb; --ic-line: #4f8be6; --ic-case: #ffffff;
     color-scheme: light;
 }
 :root.dark {
@@ -19,9 +22,11 @@
     --border: #3a3f46;
     --accent: #0ef6ae;
     --accent-text: #0b1512;
+    --ok: #3fb950;
     --danger: #ff6b6b;
     --warn: #e3b341;
     --input: #15171a;
+    --ic-hole: #2a2517; --ic-edge: #15120d; --ic-bit: #a9b0b8; --ic-bit-hi: #e8ebee; --ic-bit-edge: #3a4047; --ic-dim: #58a6ff; --ic-line: #79b0f0; --ic-case: #0a1424;
     color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -45,9 +50,15 @@ button.b { flex: 1; min-width: 0; padding: 6px 8px; border-radius: 4px; border: 
 button.b:hover:not(:disabled) { border-color: var(--accent); }
 button.b.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 button.b.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+button.b.grow0 { flex: 0 0 auto; }
+.confirm { border: 1px solid var(--danger); border-radius: 4px; padding: 6px 8px; margin: 6px 0; font-size: 11.5px; line-height: 1.4; }
+.confirm b { color: var(--danger); }
 button.b:disabled { opacity: .45; cursor: not-allowed; }
 
 .note { color: var(--muted); font-size: 11px; margin: 4px 0; }
+.conn { display: flex; gap: 12px; color: var(--muted); font-size: 11px; margin: 4px 0; }
+.conn .on { color: var(--accent); font-weight: 600; }
+.conn .pin.on { color: var(--ok); }
 .msg { padding: 6px 8px; border-radius: 4px; margin: 6px 0; background: var(--panel); border-left: 3px solid var(--muted); white-space: pre-wrap; word-break: break-word; }
 .msg.err { border-left-color: var(--danger); }
 .msg.warn { border-left-color: var(--warn); }
@@ -68,3 +79,17 @@ button.b:disabled { opacity: .45; cursor: not-allowed; }
 .legend .bar { flex: 1; height: 6px; margin: 4px 6px 0; border-radius: 3px; }
 
 .log { white-space: pre; max-height: 110px; overflow: auto; font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; background: var(--panel); border-radius: 4px; padding: 4px 6px; color: var(--muted); }
+.hovertip { display: none; position: fixed; z-index: 100; pointer-events: none; max-width: min(240px, calc(100vw - 8px)); background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; font-size: 11px; line-height: 1.35; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2); }
+.q { cursor: help; display: inline-flex; align-items: center; justify-content: center; width: 11px; height: 11px; margin-left: 4px; border: 1px solid currentColor; border-radius: 50%; font-size: 8px; font-weight: 600; line-height: 1; vertical-align: 1px; opacity: 0.7; }
+
+/* Field and step icons (icons.js) */
+.ic { display: inline-flex; flex: none; width: 28px; height: 23px; cursor: help; }
+.ic svg { width: 100%; height: 100%; display: block; }
+.lt { display: inline-flex; align-items: center; gap: 4px; min-height: 23px; }
+.b.withic { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.b.withic .ic { width: 24px; height: 20px; margin: -3px 0; cursor: inherit; }
+.icpop { position: fixed; display: none; z-index: 60; max-width: 240px; padding: 8px 10px; border-radius: 6px; background: var(--panel); --ic-void: var(--panel); color: var(--text); border: 1px solid var(--border); box-shadow: 0 4px 16px rgb(0 0 0 / .25); font-size: 12px; line-height: 1.4; pointer-events: none; }
+.icpop svg { width: 168px; height: 140px; display: block; margin: 0 auto 4px; }
+.icpop div:empty { display: none; }
+/* Inputs line up across a row even when only some labels carry an icon. */
+.grid2 > label.f { justify-content: flex-end; }

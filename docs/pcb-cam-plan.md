@@ -68,7 +68,7 @@ The authoritative definition is `PROJECT_SCHEMA` in `plugins/pcb-cam/ui/core/pro
   "output": { "dialect":"grbl", "toolChange":"m6" /* or "split" */, "decimals":4 }
 }
 ```
-Operation parameters beyond those above (drill-to-mill, clearing strategy) are settled in Phase 2.
+Phase 2 added the optional fields `face` (every operation), `direction` (cutout) and `output.spindleDelay`; see Phase 2 below.
 
 ### Tool database
 gSender has no tool database. Its `workspace.tools` is only a fixed list of five end-mill diameters for the Probe widget's dropdown, and plugins can't write to the workspace. So PCB CAM keeps its own.
@@ -184,25 +184,40 @@ Changes to existing files:
      - 16 KiCad drill-format variants of one board agree to 1.44 µm.
      - 10 copper layers from 5 KiCad demo boards match KiCad's own SVG plot pixel for pixel at 80 px/mm (12.5 µm). The comparator was confirmed to catch one dropped pad and a 50 µm shift.
      - The core gives identical results in Chrome and Node.
-2. **Operations and G-code:**
-   - Isolation (multi-pass, V-bit width from depth, climb/conventional) with region clipping and seams.
-   - Drilling (tool mapping, mill oversize holes, peck).
-   - Cutout (tabs).
-   - Clearing (rest machining).
-   - Planner for ordering, tool grouping and nearest-neighbour travel.
-   - Grbl/grblHAL emitter: `M6 T<n>` or split files, with a warning when the tool-change option is `Ignore`.
-   - Analysis: narrow gaps, uncut copper, region suggestions.
-3. **Plugin UI (the usable product):**
-   - `tools-page` workspace with tabs for inputs, tools, regions, operations, preview and output.
-   - 2D board view (SVG) with region drawing.
-   - 3D preview on the visualizer, and Load into gSender.
-   - Tool database stored in plugin storage, with JSON export/import.
-   - Save/open `.pcbcam.json`.
+2. **Operations and G-code:** done (2026-10-17). Entry point `generate(project, layers, { toolChangeOption }) → { ok, issues, operations, files, stats }`; analysis is separate (`analyzeProject`, `narrowGaps`, `suggestRegions`).
+   - **Isolation** (`ops/isolation.js`): passes at `w/2 + i·w·(1 − overlap)` from the copper, V-bit width from depth, climb/conventional. Computed on the whole layer, then clipped to the region grown by one tool width (the seam).
+   - **Regions** (`regions.js`): rect, polygon, component (convex hull of the part's pads on every layer + margin, so the area under the part is included), net (+ margin), remainder. `remainder` subtracts only regions used by operations of the **same type** on the same input, so a clearing region doesn't punch a hole in isolation.
+   - **Drilling** (`ops/drilling.js`): plated/non-plated and diameter filters, region by hole centre. A drill plunges (pecks written out as moves; Grbl has no G81–G83) and warns when the hole size differs by > 0.05 mm. An end mill plunges holes its own size, helix-mills larger holes (pitch = stepdown, climb) and mills slots (centreline, or concentric contours when wider). Slots with a drill, and holes smaller than the tool, are skipped with a warning.
+   - **Cutout** (`board.js`, `ops/cutout.js`): outline centrelines chained into loops (0.01 mm join tolerance) and filled even-odd, so cut-outs inside the board are holes; open outlines are `outline-open` errors with a location. Outside/inside/on, optional `direction`, depth levels, tabs evenly spaced on outer edges (tab gap = width + tool diameter, raised to `-stock + height`).
+   - **Clearing** (`ops/clearing.js`): concentric passes over the copper-free area inside the region and board (copper bounds + 1 mm without an outline). Each pass is offset from the previous one (≈ 8× faster on a dense board). `rest` keeps only passes whose tool disc reaches copper that earlier isolation/clearing on the same input left.
+   - **Board side** (`face`, new optional op field): bottom operations are mirrored in X about the board centre. Default: copper ops follow their input's side; drilling and cutout run on the bottom only when every copper op is on the bottom (single-sided bottom-copper boards). Mirrored ops are generated turning the other way, so climb stays climb. Mixed sides insert `M0` with a "flip the board" comment and a `flip-board` warning.
+   - **Planner** (`plan.js`): user order is kept (it matters: rest machining, drilling before cutout); nearest-neighbour ordering within each op, loops start at their nearest vertex; ops that produce nothing are skipped. Warnings: `cutout-not-last`, `toolchange-ignored` (several tools, `m6`, gSender option `Ignore`).
+   - **Grbl emitter** (`gcode/grbl.js`): G90 G94 G17 G21, Z0 = copper surface, rapids only above travel Z, `M6 T<n>` when the job has more than one tool (tool change at safe Z with the spindle off), `M3 S… / G4 P<spindleDelay>` (new optional `output.spindleDelay`, default 2 s), feed restated per operation, ASCII-only comments, `M30`. `split` writes one file per tool (and side).
+   - **Analysis** (`analysis/index.js`): `tool-too-wide` where a cut can't separate copper islands of different nets (same-net merges are ignored), with location, measured gap and cut width; `not-isolated` for copper edges outside every isolation region; `suggestRegions` clusters those gaps into polygons for a finer tool.
+   - **Verification:** 13 new tests (60 total): offset distances, climb orientation, region seams, analysis on a 0.15 mm gap, drilling/pecking/helix/slots, cutout bounds and tab length, clearing keep-out and rest machining, bottom mirroring, a G-code sanity checker (rapids above travel Z, feeds set, spindle on while cutting, tool changes at safe Z, depth limits, bounds), split output, a golden `.nc` (`tests/fixtures/test-board/`, refresh with `UPDATE_GOLDEN=1 npm test`) and a KiCad end-to-end run through commands. Real boards: esp_prog 0.2 s, watchy 0.9 s, Glasgow revC (both sides, clearing) 4.8 s.
+3. **Plugin UI (the usable product):** built (2026-10-18), not yet verified for memory in the real app.
+   - **FlatCAM-style layout and workflow** (reworked 2026-10-19): menu bar (File / Edit / View / Tools) and toolbar; side panel with **Project** (object tree: Gerber, Excellon, Geometry, CNC Job; click selects, Cmd/Ctrl-click adds, double-click opens, checkbox shows on the plot), **Selected** (the object's form) and **Tool** (tool library) tabs; plot-area tabs **Plot Area**, **Preferences** (stock and heights, origin, output, areas) and a G-code viewer; status bar with messages and cursor coordinates. Keys: Del, V, =, −, Esc.
+   - **Workflow: Gerber → Geometry → CNC Job.** A Gerber object's form (Isolation Routing, Non-copper Clearing, Board Cutout) or an Excellon object's Drilling form creates a **Geometry object**, which is one project operation (named `<file>_iso` etc.). Its preview is generated on its own in the worker as soon as anything it depends on changes (`generate`/`analyzeProject` take `only: [opIds]`; the rest of the project still shapes remainder regions, faces and the machine frame, so preview and G-code match). Geometry forms edit tool, Cut Z, passes, overlap, area, board side and the project's copy of the tool's feeds/RPM/depth per pass. **Generate CNCJob** on one or several selected geometries makes a **CNC Job object** (stored separately in plugin storage as `jobs`: name + geometry ids) with stats, problems, G-code files named after the job, Load into gSender and View code; it shows "out of date" when a geometry or output setting changes.
+   - Cutout tabs are now spaced from the outline's lowest-left vertex instead of the cut's start point, so they don't move when the previous operation ends elsewhere.
+   - **Standard job** (`ui/assets/defaults.js`): isolation per copper layer (0.2 mm 30° V-bit, 0.08 mm deep, 2 passes), drilling and cutout with a 0.8 mm end mill; switches output to one file per tool when gSender's tool change option is `Ignore`. Default tools are conservative for a trim-router spindle.
+   - **"Use a finer bit there"** on a `tool-too-wide` group: `suggestRegions` polygons around the gaps get a copy of the geometry (`<name>_fine`) with the finest library tool that fits; the original moves to the remainder, and both are left selected for one CNC job. On the ch32v006 test board this cleared all 22 QFN gap warnings in one click.
+   - **Board view** (`ui/assets/view.js`) is a `<canvas>`, not SVG: layers, regions, toolpaths and markers are Path2D objects built once; pan/zoom only redraws (nothing for the session recorder to capture). Toolpaths are mapped back from machine coordinates with the new `transform: { mirrorX, shift }` field of `generate`'s result.
+   - **Generation runs in a module worker** (`ui/assets/worker.js`, `engine.js`); the worker parses its own copy of each file, so only the project crosses on each Generate. Main-thread fallback when workers are unavailable.
+   - **Persistence in three tiers** (gSender unloads the plugin iframe when you leave the CAM page; its port, and so the iframe origin, changes every launch):
+     - gSender plugin storage (its settings file, rewritten whole on each change, 256 KB per write): only small data, as JSON strings (`storage.set` deep-merges objects; delete-then-set lost the project when the page unloaded in between): `project.json`, `jobs.json`, `tooldb.json`, `ui.json` (tabs, selection, visibility, zoom), `folder.json` (projects folder id and name, open project file name, whether it is outside the folder).
+     - sessionStorage (`assets/persist.js`, capped at 3 M characters, shared with gSender's page): board file texts and frozen jobs' G-code. Survives leaving the page, not quitting gSender.
+     - The projects folder, through the File System Access API (the manifest lists the `fileSystem` permission, which gSender grants to Electron). The user picks it once, before opening the first board files; a hidden `.pcbcam-workspace.json` marker gives it an id. Every project is a file in it (`<board>.pcbcam.json`: `{ format: 'pcb-cam-project', version, project, boardFiles, jobs }`), created when the project gets content and written every 3 s while something changed. The folder and file handles are kept in IndexedDB, which lasts only one gSender session (random port → new origin). After a restart the workspace starts empty and the Project tab asks to reconnect the folder (one pick, checked against the marker), then reopens the last project from its file. A project is never shown half-restored. File → Save project (⌘S) writes now, Save a copy (⇧⌘S) writes anywhere, and Open project works on the picked file in place, inside the folder or anywhere else (it is autosaved there; after a restart the Project tab asks to open that file again).
+     - Toolpaths and live jobs' G-code are never stored; they are regenerated (deterministic).
+   - **CNC jobs are independent objects** (FlatCAM): deleting a geometry freezes every job that has G-code (kept as generated, can't be regenerated, marked "kept"); jobs without G-code just lose the geometry.
+   - Follows gSender's light/dark setting (`workspace.enableDarkMode`), OS setting as fallback.
+   - Manifest needs `workspace:get:state` and `gcode:load:to:visualizer` (permissions `workspace:read`, `visualizer:load`); changing the manifest needs a gSender restart.
+   - Not done: polygon drawing, the visualizer-overlay preview (Load into gSender covers 3D), real-app heap check.
 4. **Release v1 of PCB CAM** (packaging and README; first install needs a gSender restart).
 5. **Later — MCP:**
    - MCP server exposing the commands and queries as tools, over stdio and Streamable HTTP.
    - Agent link: the plugin dials out to the server, which fetches the tool database and project on request; agent changes arrive as proposals.
    - PNG preview rendering for agents.
+6. **Later — bit calibration and width-aware isolation:** measure what a bit really cuts with a two-line test pattern, then plan isolation around that width (shallower cuts in tight gaps, a fine bit only where needed, and a preview of the finished board compared with the Gerber). Plan: [bit-calibration-plan.md](bit-calibration-plan.md).
 
 ## Phase 0 findings (2026-10-16, gSender 1.7.0-Edge-2, KiCad 10.0.5 fixtures)
 A throwaway spike plugin was run inside gSender's plugin page (served by the gSender server, opened in Chrome). It talked to a localhost Node server.

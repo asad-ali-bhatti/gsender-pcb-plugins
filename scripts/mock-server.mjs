@@ -32,6 +32,12 @@ await ensureSdk();
 createServer(async (req, res) => {
     const url = decodeURIComponent(new URL(req.url, 'http://x').pathname);
     let file;
+    if (url === '/fixtures/demo.pcbcam.json') {
+        // A reviewed demo project for Project Runner (tests/fixtures/demo-project.mjs).
+        const { demoDoc, withHashes } = await import('../tests/fixtures/demo-project.mjs');
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(await withHashes(demoDoc())));
+        return;
+    }
     if (url === '/' || url === '/host.html') file = path.join(ROOT, 'tests/mock-host.html');
     else if (url === '/plugin-sdk/index.js') file = SDK;
     else {
