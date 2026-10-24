@@ -26,45 +26,53 @@ Plugins for [gSender](https://github.com/Sienci-Labs/gsender) that turn a hobby 
 
 ## Features
 
-**From board files to G-code (PCB CAM)**
-- Opens Gerber (RS-274X with X2) and Excellon files from KiCad, EasyEDA, Eagle and Altium, and detects each layer's role.
-- Isolation routing with V-bits or end mills: the cut width comes from the bit's tip and angle at your depth, with multiple passes, overlap and climb or conventional milling.
-- Copper clearing, drilling (drill, peck, or mill holes and slots with an end mill) and board cutout with holding tabs.
-- Per-region settings: a fine bit around one part or net, a coarser bit everywhere else.
-- Top or bottom side, with mirroring for bottom-up jobs.
-- A tool library preloaded with common kit bits: 20° and 30° V-bits, 0.8 and 1.0 mm drills, and end mills.
-- A FlatCAM-style workspace (Gerber → Geometry → CNC Job), with a toolpath preview, drill order, cut length and time.
-- Projects autosave to a projects folder on disk. One click loads a job into gSender's visualizer.
-- G-code runs on its own, with no other plugin needed.
+### 🧭 PCB CAM: board files → G-code
+- 📂 Opens Gerber and Excellon from KiCad, EasyEDA, Eagle and Altium.
+- 🔍 Detects each layer for you.
+- ✏️ Isolation with V-bits or end mills, sized from the bit's real cut width.
+- 🧹 Copper clearing.
+- 🕳️ Drilling: drill, peck, or mill holes and slots.
+- ✂️ Board cutout with holding tabs.
+- 🎯 Different bits for different areas of the board.
+- 🔄 Top or bottom side, mirrored for you.
+- 🧰 Tool library with common kit bits.
+- 👀 Toolpath preview, drill order, cut length and time.
+- 💾 Projects autosave to disk.
+- 📤 One click loads a job into gSender.
 
-**Running the whole board (Project Runner)**
-- Opens a PCB CAM project and refuses jobs that changed since you reviewed them.
-- A three-step wizard: pick jobs, order them, run them.
-- Adds a bit change wherever the bit changes: raise Z, swap the bit, then a guided Zero Z on the copper at X0 Y0, with a screwdriver test of the probe clip.
-- **Built-in levelling:** probes one height map per board, sized to the copper jobs. It levels each isolation or clearing job exactly once and loads it as `<job>_leveled.nc`.
-- Blocks a levelled job when X0 Y0 has moved since probing, or when the job runs past the map.
-- Stopped probing keeps its points; Continue finishes the rest.
-- Your own steps between jobs: a pause with a note, a few lines of G-code, or an extra bit change.
-- Tracks every job (done, cancelled, failed) in a `.pcbrun.json` run file, with history. Restart keeps the history and the height map.
-- Attaches to a job you started from gSender's own Start button, and to a running job after the panel reloads.
-- Start is blocked until gSender's loaded file matches the step, the machine is Idle and connected, and nothing is in alarm.
+### ▶️ Project Runner: mill the whole board
+- 🪄 Three steps: pick jobs, order, run.
+- 🛑 Refuses jobs changed since you reviewed them.
+- 🔧 Adds bit changes for you.
+- 📏 Guided Zero Z on the copper at X0 Y0.
+- 🪛 Tests the probe clip before it probes.
+- 🗺️ Probes one height map per board.
+- 📐 Levels each copper job exactly once.
+- 🚧 Blocks a levelled job if X0 Y0 moved.
+- ⏯️ Stopped probing picks up where it left off.
+- 📝 Add your own pauses, notes or G-code.
+- ✅ Tracks every job: done, cancelled, failed.
+- 🔁 Restart keeps history and the height map.
+- 🔒 Start stays locked until the machine is ready.
 
-**Probing and levelling on its own (Autoleveler)**
-- Probes a grid over the loaded job (its bounds plus a margin), or over any area you set.
-- Probes the middle first, then the rest in a serpentine order.
-- Draws the points live on the 3D visualizer, coloured by height, with an optional mesh. A hoverable heat map shows min, max and range.
-- Levels the loaded G-code: it splits long moves, turns arcs into lines, and handles mm and inch files.
-- A stopped scan resumes. Height maps import and export as JSON.
+### 📊 Autoleveler: probe and level any job
+- 📍 Probes a grid over the loaded job.
+- 🌈 Live height points on the 3D view.
+- 🔥 Heat map with min, max and range.
+- 〰️ Levels any G-code, arcs included.
+- ⏯️ Resumes a stopped scan.
+- 📁 Import and export height maps.
 
-**Safety, throughout**
-- A person confirms every machine motion. The plugins never move the machine on their own.
-- Probe moves are bounded: none goes more than 1 mm below where the copper should be.
-- Messages are short and say what to do next ("Insert the 0.8 mm drill, then click Zero Z").
-- Written to keep gSender's memory flat during long jobs.
+### 🛡️ Safety first
+- 🙋 You confirm every machine move.
+- ⬇️ Probing never goes more than 1 mm too deep.
+- 💬 Short messages that say what to do next.
+- 🧠 Memory stays flat on long jobs.
 
-**Extras for developers and networked machines**
-- `scripts/grblhal-sim.mjs`: a grblHAL simulator that real gSender connects to, with fault injection (disconnect, reset, power cycle, limit trip). The screenshots above were taken with it.
-- `scripts/cnc_bridge.py`: a TCP-to-serial bridge with flow control, for running a USB controller from a Raspberry Pi over the network.
+### 🛠️ For developers
+- 🤖 grblHAL simulator that real gSender connects to.
+- 💥 Fault injection: disconnect, reset, power cut, limit trip.
+- 🌐 TCP-to-serial bridge for networked machines.
 
 ## Quick start
 
